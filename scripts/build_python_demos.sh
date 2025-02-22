@@ -56,7 +56,7 @@ python swig.dat build_ext --inplace -D__LINUX__ > build.log 2>&1 || {
 }
 
 # Copy only the necessary files
-cp pixy.py _pixy*.so "$BUILD_DIR" || { RED_TEXT; echo "Failed to copy build artifacts to $BUILD_DIR"; exit 1; }
+cp pixy.py _pixy*.so *.py "$BUILD_DIR" || { RED_TEXT; echo "Failed to copy build artifacts to $BUILD_DIR"; exit 1; }  # Copy demo scripts too
 
 # Verify build output
 files=("$BUILD_DIR/_pixy*.so")
