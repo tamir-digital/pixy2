@@ -24,10 +24,11 @@ uname -a
 # Use local build directory instead of project root
 TARGET_BUILD_FOLDER="build"
 
-# Create build directory in current working directory
-mkdir -p "$TARGET_BUILD_FOLDER/python_demos" || { 
+# Create build directory in current working directory with full path
+BUILD_DIR="$SCRIPT_DIR/$TARGET_BUILD_FOLDER/python_demos"
+mkdir -p "$BUILD_DIR" || { 
     RED_TEXT
-    echo "Failed to create build directory at $TARGET_BUILD_FOLDER/python_demos"
+    echo "Failed to create build directory at $BUILD_DIR"
     exit 1 
 }
 
@@ -57,15 +58,15 @@ python swig.dat build_ext --inplace -D__LINUX__ > build.log 2>&1 || {
 }
 
 # Copy only the necessary files
-cp pixy.py _pixy*.so "$TARGET_BUILD_FOLDER/python_demos" || { RED_TEXT; echo "Failed to copy build artifacts"; exit 1; }
+cp pixy.py _pixy*.so "$BUILD_DIR" || { RED_TEXT; echo "Failed to copy build artifacts to $BUILD_DIR"; exit 1; }
 
 # Verify build output
-files=("$TARGET_BUILD_FOLDER/python_demos/_pixy*.so")
+files=("$BUILD_DIR/_pixy*.so")
 if (( ${#files[@]} )); then
   GREEN_TEXT
   echo "SUCCESS: Built ${#files[@]} .so files"
   echo "Build artifacts:"
-  ls -l ../../../../build/python_demos
+  ls -l "$BUILD_DIR"
 else
   RED_TEXT
   echo "FAILURE: No .so files were built"
