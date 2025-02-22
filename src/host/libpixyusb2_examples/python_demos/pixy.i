@@ -16,6 +16,14 @@
 // Add raw frame function declarations
 int get_raw_frame_width();
 int get_raw_frame_height();
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void set_debug(bool enable);
+#ifdef __cplusplus
+}
+#endif
 %}
 
 // Define and expose constants for Python
@@ -31,6 +39,15 @@ int get_raw_frame_height();
 // Frame dimension getters
 extern int get_raw_frame_width();
 extern int get_raw_frame_height();
+
+// Debug control - declare as C function
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern void set_debug(bool enable);
+#ifdef __cplusplus
+}
+#endif
 
 %inline %{
 extern int init();

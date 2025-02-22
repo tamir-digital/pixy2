@@ -8,36 +8,53 @@ Pixy2  pixy_instance;
 const int RAW_FRAME_WIDTH = 316;
 const int RAW_FRAME_HEIGHT = 208;
 
+// Debug control
+static bool debug_enabled = false;
+
+// Declare as pure C function to prevent name mangling
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void set_debug(bool enable)
+{
+    debug_enabled = enable;
+}
+
+#ifdef __cplusplus
+}
+#endif
+
 int init()
 {
-  printf("Debug: Attempting to initialize Pixy2...\n");
+  if (debug_enabled) printf("Debug: Attempting to initialize Pixy2...\n");
   int result = pixy_instance.init();
-  printf("Debug: Pixy2.init() returned %d\n", result);
+  if (debug_enabled) printf("Debug: Pixy2.init() returned %d\n", result);
   return result;
 }
 
 int stop()
 {
-  printf("Debug: Stopping Pixy2...\n");
+  if (debug_enabled) printf("Debug: Stopping Pixy2...\n");
   int result = pixy_instance.m_link.stop();
-  printf("Debug: Pixy2.stop() returned %d\n", result);
+  if (debug_enabled) printf("Debug: Pixy2.stop() returned %d\n", result);
   return result;
 }
 
 int resume()
 {
-  printf("Debug: Resuming Pixy2...\n");
+  if (debug_enabled) printf("Debug: Resuming Pixy2...\n");
   int result = pixy_instance.m_link.resume();
-  printf("Debug: Pixy2.resume() returned %d\n", result);
+  if (debug_enabled) printf("Debug: Pixy2.resume() returned %d\n", result);
   return result;
 }
 
 int get_raw_frame(uint8_t *frame)
 {
-  printf("Debug: Getting raw frame...\n");
+  if (debug_enabled) printf("Debug: Getting raw frame...\n");
   uint8_t *bayerFrame;
   int result = pixy_instance.m_link.getRawFrame(&bayerFrame);
-  printf("Debug: getRawFrame() returned %d\n", result);
+  if (debug_enabled) printf("Debug: getRawFrame() returned %d\n", result);
   if (result < 0) return result;
   
   // Copy the frame data

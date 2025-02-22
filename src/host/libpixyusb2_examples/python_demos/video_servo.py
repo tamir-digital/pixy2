@@ -366,6 +366,9 @@ def main():
         # Setup logging and get terminal handler
         log_file, terminal = setup_logging()
         
+        # Disable debug output from Pixy2
+        pixy.set_debug(False)
+        
         # Initialize Pixy2 with all debug suppressed
         init_result = init_pixy_with_suppression()
         if init_result < 0:
