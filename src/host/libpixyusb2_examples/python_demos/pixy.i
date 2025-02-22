@@ -12,19 +12,47 @@
 #include "Pixy2Line.h"
 #include "Pixy2CCC.h"
 #include "libpixyusb2.h"
+
+// Add raw frame function declarations
+int get_raw_frame_width();
+int get_raw_frame_height();
 %}
+
+// Define and expose constants for Python
+%constant int RAW_FRAME_WIDTH = 316;
+%constant int RAW_FRAME_HEIGHT = 208;
 
 %array_class(struct Block, BlockArray);
 %array_class(struct Vector, VectorArray);
 %array_class(struct Intersection, IntersectionArray);
 %array_class(struct Barcode, BarcodeArray);
+%array_class(uint8_t, RawFrame);
 
-
+// Frame dimension getters
+extern int get_raw_frame_width();
+extern int get_raw_frame_height();
 
 %inline %{
 extern int init();
 
+/*!
+  @brief       Stop the current program running on Pixy
+  @return      Zero on success, negative otherwise
+*/
+extern int stop();
 
+/*!
+  @brief       Resume the current program running on Pixy
+  @return      Zero on success, negative otherwise
+*/
+extern int resume();
+
+/*!
+  @brief       Get raw frame from Pixy camera in Bayer format
+  @param[out]  frame  Pointer to buffer to store the frame data
+  @return      Zero on success, negative otherwise
+*/
+extern int get_raw_frame(RawFrame *frame);
 
 /*!
   @brief       Select active running program on Pixy

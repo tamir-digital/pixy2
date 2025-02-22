@@ -1,11 +1,48 @@
 #include <string.h>
 #include "libpixyusb2.h"
+#include <stdio.h>
 
 Pixy2  pixy_instance;
 
+// Define frame dimensions constants
+const int RAW_FRAME_WIDTH = 316;
+const int RAW_FRAME_HEIGHT = 208;
+
 int init()
 {
-  return  pixy_instance.init();
+  printf("Debug: Attempting to initialize Pixy2...\n");
+  int result = pixy_instance.init();
+  printf("Debug: Pixy2.init() returned %d\n", result);
+  return result;
+}
+
+int stop()
+{
+  printf("Debug: Stopping Pixy2...\n");
+  int result = pixy_instance.m_link.stop();
+  printf("Debug: Pixy2.stop() returned %d\n", result);
+  return result;
+}
+
+int resume()
+{
+  printf("Debug: Resuming Pixy2...\n");
+  int result = pixy_instance.m_link.resume();
+  printf("Debug: Pixy2.resume() returned %d\n", result);
+  return result;
+}
+
+int get_raw_frame(uint8_t *frame)
+{
+  printf("Debug: Getting raw frame...\n");
+  uint8_t *bayerFrame;
+  int result = pixy_instance.m_link.getRawFrame(&bayerFrame);
+  printf("Debug: getRawFrame() returned %d\n", result);
+  if (result < 0) return result;
+  
+  // Copy the frame data
+  memcpy(frame, bayerFrame, RAW_FRAME_WIDTH * RAW_FRAME_HEIGHT);
+  return 0;
 }
 
 int change_prog (const char *  program_name)
@@ -118,4 +155,15 @@ void set_lamp (int upper, int lower)
 void set_servos (int  S1_Position, int  S2_Position)
 {
   pixy_instance.setServos (S1_Position, S2_Position);
+}
+
+// Add getter functions for frame dimensions
+int get_raw_frame_width()
+{
+    return RAW_FRAME_WIDTH;
+}
+
+int get_raw_frame_height()
+{
+    return RAW_FRAME_HEIGHT;
 }
