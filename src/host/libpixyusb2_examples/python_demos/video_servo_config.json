@@ -1,0 +1,19 @@
+{
+    "video": {
+        "output_dir": "output",
+        "codec": "XVID",
+        "fps": 30,
+        "show_preview": true
+    },
+    "servo": {
+        "pan_step": 100,
+        "tilt_step": 100,
+        "update_interval": 0.016,
+        "pan_gain": 400,
+        "tilt_gain": 500
+    },
+    "debug": {
+        "log_level": "INFO",
+        "show_fps": true
+    }
+}

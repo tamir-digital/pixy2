@@ -11,20 +11,149 @@ import time
 import select
 import numpy as np
 import cv2
+import os
+from datetime import datetime
+import logging
+import json
+from contextlib import contextmanager
+import io
+import fcntl
+import platform
+import atexit
+
+# Permanently redirect stderr to /dev/null
+stderr_dev_null = open(os.devnull, 'w')
+os.dup2(stderr_dev_null.fileno(), sys.stderr.fileno())
+
+# Register cleanup to prevent file descriptor leaks
+def cleanup_stderr():
+    stderr_dev_null.close()
+atexit.register(cleanup_stderr)
+
+# Immediately suppress system messages on macOS
+if platform.system() == 'Darwin':
+    # Set environment variables
+    os.environ['OBJC_DEBUG_MISSING_POOLS'] = 'NO'
+    os.environ['OBJC_DISABLE_GC'] = 'YES'
+    os.environ['LIBUSB_DEBUG'] = '0'  # Disable libusb debug output
+    os.environ['LIBUSB_LOG_LEVEL'] = '0'  # Set libusb log level to none
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "video": {
+        "output_dir": "output",
+        "codec": "XVID",
+        "fps": 30,
+        "show_preview": True
+    },
+    "servo": {
+        "pan_step": 100,
+        "tilt_step": 100,
+        "update_interval": 0.016,  # 60Hz
+        "pan_gain": 400,
+        "tilt_gain": 500
+    },
+    "debug": {
+        "log_level": "INFO",
+        "show_fps": True,
+        "suppress_pixy_debug": True  # New option to control Pixy debug output
+    }
+}
+
+@contextmanager
+def suppress_stdout_stderr():
+    """Context manager to capture and suppress stdout and stderr"""
+    # Save the original stdout/stderr
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    
+    # Create file descriptors for stdout/stderr
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    
+    # Save the original file descriptors
+    saved_stdout_fd = os.dup(stdout_fd)
+    saved_stderr_fd = os.dup(stderr_fd)
+    
+    try:
+        # Open null device
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        
+        # Replace file descriptors
+        os.dup2(devnull_fd, stdout_fd)
+        os.dup2(devnull_fd, stderr_fd)
+        
+        # Create string buffers for Python-level capture
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        
+        # Replace Python-level stdout/stderr
+        sys.stdout = stdout_buffer
+        sys.stderr = stderr_buffer
+        
+        yield
+    finally:
+        # Restore Python-level stdout/stderr
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        
+        # Restore file descriptors
+        os.dup2(saved_stdout_fd, stdout_fd)
+        os.dup2(saved_stderr_fd, stderr_fd)
+        
+        # Close saved file descriptors
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
+        
+        # Get the captured output
+        stdout_value = stdout_buffer.getvalue()
+        stderr_value = stderr_buffer.getvalue()
+        
+        # If there's any stderr content, log it as error
+        if stderr_value:
+            logging.error(stderr_value.strip())
+        
+        # If there's any stdout content, log it as debug
+        if stdout_value:
+            logging.debug(stdout_value.strip())
+
+def load_config():
+    """Load configuration from file or create default"""
+    config_path = os.path.join(os.path.dirname(__file__), 'video_servo_config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                # Merge with defaults to ensure all keys exist
+                merged = DEFAULT_CONFIG.copy()
+                merged.update(config)
+                return merged
+        else:
+            # Save default config
+            with open(config_path, 'w') as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4)
+            return DEFAULT_CONFIG
+    except Exception as e:
+        logging.warning(f"Error loading config, using defaults: {str(e)}")
+        return DEFAULT_CONFIG
+
+# Load configuration
+CONFIG = load_config()
 
 # Constants
 PIXY_RCS_MAXIMUM_POSITION = 1000
 PIXY_RCS_MINIMUM_POSITION = 0
 PIXY_RCS_CENTER_POSITION = ((PIXY_RCS_MAXIMUM_POSITION - PIXY_RCS_MINIMUM_POSITION) / 2)
-PAN_STEP = 100
-TILT_STEP = 100
+PAN_STEP = CONFIG['servo']['pan_step']
+TILT_STEP = CONFIG['servo']['tilt_step']
 
 # PID Controller Constants
 PID_MAXIMUM_INTEGRAL = 2000
 PID_MINIMUM_INTEGRAL = -2000
-PAN_GAIN = 400
-TILT_GAIN = 500
-UPDATE_INTERVAL = 0.016  # 60Hz update rate
+PAN_GAIN = CONFIG['servo']['pan_gain']
+TILT_GAIN = CONFIG['servo']['tilt_gain']
+UPDATE_INTERVAL = CONFIG['servo']['update_interval']
 
 class PID_Controller:
     def __init__(self, proportion_gain, integral_gain, derivative_gain, servo):
@@ -84,103 +213,294 @@ def bayer_to_rgb(bayer_frame, width, height):
     rgb = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
     return rgb
 
-def main():
-    print("Pixy2 Python SWIG Example -- Video Recording with Pan/Tilt Control")
-    print(f"OpenCV version: {cv2.__version__}")
-    print(f"NumPy version: {np.__version__}")
+def setup_logging():
+    """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    logs_dir = "logs"
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
+    # Generate log filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(logs_dir, f"pixy2_session_{timestamp}.log")
+    
+    # Remove any existing handlers
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    
+    # Create logger
+    root.setLevel(logging.DEBUG)  # Capture everything at root level
+    
+    # File handler - gets everything
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root.addHandler(file_handler)
+    
+    # Console handler - only gets important messages
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)  # Only show warnings and errors
+    console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    
+    # Add filter to capture Pixy2 debug messages
+    class Pixy2DebugFilter(logging.Filter):
+        def filter(self, record):
+            # Filter out debug messages and Pixy2-related messages from console
+            if "Debug:" in record.msg or "Pixy2" in record.msg:
+                return False
+            return True
 
+    # Add filter to console handler only
+    console_handler.addFilter(Pixy2DebugFilter())
+    root.addHandler(console_handler)
+    
+    # Configure other loggers to be quiet
+    for name in ['pixy', 'opencv', 'PIL', 'OpenCV']:
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.WARNING)
+        logger.propagate = False
+    
+    # Create terminal handler class
+    class TerminalHandler:
+        def __init__(self):
+            self.status_line = ""
+            self.interface_shown = False
+            self._suppress_output = False
+            
+        def suppress_output(self, suppress=True):
+            """Temporarily suppress output"""
+            self._suppress_output = suppress
+            
+        def clear_screen(self):
+            """Clear the terminal screen"""
+            if not self._suppress_output:
+                os.system('clear' if os.name == 'posix' else 'cls')
+            self.interface_shown = False
+            
+        def show_interface(self, log_file):
+            """Show the initial interface"""
+            if not self.interface_shown and not self._suppress_output:
+                self.clear_screen()
+                lines = [
+                    "\n=== Pixy2 Video Servo Control ===",
+                    f"Session log: {os.path.basename(log_file)}",
+                    "\nControls (work in both terminal and video window):",
+                    "a/d : Pan left/right",
+                    "w/s : Tilt up/down",
+                    "c   : Center servos",
+                    "r   : Toggle recording",
+                    "p   : Toggle preview",
+                    "q   : Quit",
+                    "\nStatus:",
+                    ""  # Empty line for status updates
+                ]
+                print('\n'.join(lines))
+                self.interface_shown = True
+                
+        def update_status(self, status):
+            """Update the status line"""
+            if not self._suppress_output:
+                if self.status_line:
+                    # Move up one line and clear it
+                    print('\033[F\033[K', end='', flush=True)
+                print(status, flush=True)
+                self.status_line = status
+            
+        def show_message(self, message):
+            """Show a temporary message without disturbing status"""
+            if not self._suppress_output:
+                if self.status_line:
+                    # Save cursor position, move up one line, show message, restore position
+                    print(f'\033[s\033[F\033[K{message}\033[u', end='', flush=True)
+                else:
+                    print(message, flush=True)
+
+    return log_file, TerminalHandler()
+
+def ensure_output_dir():
+    """Ensure output directory exists"""
+    output_dir = CONFIG['video']['output_dir']
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    return output_dir
+
+def get_video_path():
+    """Generate timestamped video filename"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(ensure_output_dir(), f"pixy2_recording_{timestamp}.avi")
+
+def handle_key_event(key, target_pan, target_tilt):
+    """Handle keyboard input from both terminal and OpenCV window"""
+    if key in [ord('a'), ord('A')]:  # left
+        return max(PIXY_RCS_MINIMUM_POSITION, target_pan - PAN_STEP), target_tilt
+    elif key in [ord('d'), ord('D')]:  # right
+        return min(PIXY_RCS_MAXIMUM_POSITION, target_pan + PAN_STEP), target_tilt
+    elif key in [ord('w'), ord('W')]:  # up
+        return target_pan, min(PIXY_RCS_MAXIMUM_POSITION, target_tilt + TILT_STEP)
+    elif key in [ord('s'), ord('S')]:  # down
+        return target_pan, max(PIXY_RCS_MINIMUM_POSITION, target_tilt - TILT_STEP)
+    elif key in [ord('c'), ord('C')]:  # center
+        return PIXY_RCS_CENTER_POSITION, PIXY_RCS_CENTER_POSITION
+    return target_pan, target_tilt
+
+def init_pixy_with_suppression():
+    """Initialize Pixy2 with all debug output suppressed"""
+    # Try to access and modify the libusb context directly
+    try:
+        if hasattr(pixy, '_pixy'):
+            # Get the underlying libusb context
+            ctx = cast(pixy._pixy.get_libusb_context(), POINTER(c_void_p))
+            if ctx:
+                # Set libusb debug level to none (0)
+                pixy._pixy.libusb_set_debug(ctx, 0)
+    except:
+        pass
+    
     # Initialize Pixy2
-    print("Initializing Pixy2...")
-    init_result = pixy.init()
-    if init_result < 0:
-        print("Error: Pixy2 initialization failed with code:", init_result)
-        sys.exit(1)
-    print("Pixy2 initialized successfully!")
+    with suppress_stdout_stderr():
+        return pixy.init()
 
-    # Switch to video mode
-    print("Switching to video mode...")
-    prog_result = pixy.change_prog("video")
-    if prog_result < 0:
-        print("Error: Failed to change to video mode. Error code:", prog_result)
-        sys.exit(1)
-    print("Successfully changed to video mode!")
-
-    # Stop current program to allow raw frame capture
-    pixy.stop()
-
-    # Get frame dimensions
-    FRAME_WIDTH = pixy.get_raw_frame_width()
-    FRAME_HEIGHT = pixy.get_raw_frame_height()
-    print(f"Frame dimensions: {FRAME_WIDTH}x{FRAME_HEIGHT}")
-
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter('output.avi', fourcc, 30.0, (FRAME_WIDTH, FRAME_HEIGHT))
-
-    # Allocate raw frame buffer
+def main():
     try:
-        frame_buffer = pixy.RawFrame(FRAME_WIDTH * FRAME_HEIGHT)
-    except Exception as e:
-        print(f"Error allocating raw frame buffer: {str(e)}")
-        sys.exit(1)
+        # Setup logging and get terminal handler
+        log_file, terminal = setup_logging()
+        
+        # Initialize Pixy2 with all debug suppressed
+        init_result = init_pixy_with_suppression()
+        if init_result < 0:
+            print(f"Failed to initialize Pixy2 (code: {init_result})")
+            sys.exit(1)
 
-    # Initialize PID controllers
-    pan_controller = PID_Controller(PAN_GAIN, 0, PAN_GAIN, True)
-    tilt_controller = PID_Controller(TILT_GAIN, 0, TILT_GAIN, True)
+        # Switch to video mode
+        with suppress_stdout_stderr():
+            prog_result = pixy.change_prog("video")
+        if prog_result < 0:
+            print(f"Failed to switch to video mode (code: {prog_result})")
+            sys.exit(1)
 
-    # Initialize positions
-    current_pan = PIXY_RCS_CENTER_POSITION
-    current_tilt = PIXY_RCS_CENTER_POSITION
-    target_pan = PIXY_RCS_CENTER_POSITION
-    target_tilt = PIXY_RCS_CENTER_POSITION
+        # Stop current program to allow raw frame capture
+        with suppress_stdout_stderr():
+            pixy.stop()
 
-    # Set initial positions
-    print("Setting initial servo positions...")
-    try:
-        pixy.set_servos(int(current_pan), int(current_tilt))
-        print("Servos initialized successfully!")
-    except Exception as e:
-        print("Error: Failed to set initial servo positions:", str(e))
-        sys.exit(1)
+        # Get frame dimensions
+        with suppress_stdout_stderr():
+            FRAME_WIDTH = pixy.get_raw_frame_width()
+            FRAME_HEIGHT = pixy.get_raw_frame_height()
+        print(f"Frame dimensions: {FRAME_WIDTH}x{FRAME_HEIGHT}")
 
-    print("\nControls:")
-    print("a/d : Pan left/right")
-    print("w/s : Tilt up/down")
-    print("c   : Center servos")
-    print("q   : Quit")
+        # Create video writer with timestamped filename
+        fourcc = cv2.VideoWriter_fourcc(*CONFIG['video']['codec'])
+        video_path = get_video_path()
+        out = cv2.VideoWriter(video_path, fourcc, CONFIG['video']['fps'], (FRAME_WIDTH, FRAME_HEIGHT))
+        print(f"Recording video to: {video_path}")
 
-    # Initialize terminal for non-blocking input
-    fd, old_settings = init_terminal()
+        # Allocate raw frame buffer
+        try:
+            frame_buffer = pixy.RawFrame(FRAME_WIDTH * FRAME_HEIGHT)
+        except Exception as e:
+            print(f"Error allocating raw frame buffer: {str(e)}")
+            sys.exit(1)
 
-    try:
+        # Initialize PID controllers
+        pan_controller = PID_Controller(PAN_GAIN, 0, PAN_GAIN, True)
+        tilt_controller = PID_Controller(TILT_GAIN, 0, TILT_GAIN, True)
+
+        # Initialize positions
+        current_pan = PIXY_RCS_CENTER_POSITION
+        current_tilt = PIXY_RCS_CENTER_POSITION
+        target_pan = PIXY_RCS_CENTER_POSITION
+        target_tilt = PIXY_RCS_CENTER_POSITION
+
+        # Set initial positions
+        print("Setting initial servo positions...")
+        try:
+            pixy.set_servos(int(current_pan), int(current_tilt))
+            print("Servos initialized successfully!")
+        except Exception as e:
+            print("Error: Failed to set initial servo positions:", str(e))
+            sys.exit(1)
+
+        print("\nControls:")
+        print("a/d : Pan left/right")
+        print("w/s : Tilt up/down")
+        print("c   : Center servos")
+        print("r   : Toggle recording")
+        print("p   : Toggle preview")
+        print("q   : Quit")
+
+        # Initialize terminal for non-blocking input
+        fd, old_settings = init_terminal()
+
         last_update = time.time()
+        frames_processed = 0
+        start_time = time.time()
+        recording = True
+        
+        # Show interface
+        terminal.show_interface(log_file)
         
         while True:
-            # Handle input
+            # Handle terminal input
             char = getch_non_blocking()
             if char:
-                char = char.lower()
-                if char == 'a':  # left
-                    target_pan = max(PIXY_RCS_MINIMUM_POSITION, target_pan - PAN_STEP)
-                elif char == 'd':  # right
-                    target_pan = min(PIXY_RCS_MAXIMUM_POSITION, target_pan + PAN_STEP)
-                elif char == 'w':  # up
-                    target_tilt = min(PIXY_RCS_MAXIMUM_POSITION, target_tilt + TILT_STEP)
-                elif char == 's':  # down
-                    target_tilt = max(PIXY_RCS_MINIMUM_POSITION, target_tilt - TILT_STEP)
-                elif char == 'c':  # center
-                    target_pan = PIXY_RCS_CENTER_POSITION
-                    target_tilt = PIXY_RCS_CENTER_POSITION
-                elif char == 'q':  # quit
+                key = ord(char.lower())
+                if key == ord('q'):  # quit
                     break
+                elif key == ord('r'):  # toggle recording
+                    recording = not recording
+                    if recording:
+                        video_path = get_video_path()
+                        out = cv2.VideoWriter(video_path, 
+                                           cv2.VideoWriter_fourcc(*CONFIG['video']['codec']), 
+                                           CONFIG['video']['fps'], 
+                                           (FRAME_WIDTH, FRAME_HEIGHT))
+                        print(f"Started recording to: {video_path}")
+                    else:
+                        out.release()
+                        print(f"Stopped recording: {video_path}")
+                elif key == ord('p'):  # toggle preview
+                    CONFIG['video']['show_preview'] = not CONFIG['video']['show_preview']
+                    if not CONFIG['video']['show_preview']:
+                        cv2.destroyAllWindows()
+                else:
+                    # Handle pan/tilt commands
+                    target_pan, target_tilt = handle_key_event(key, target_pan, target_tilt)
 
             # Get raw frame and process it
-            ret = pixy.get_raw_frame(frame_buffer)
+            ret = -1
+            with suppress_stdout_stderr():
+                ret = pixy.get_raw_frame(frame_buffer)
             if ret >= 0:
                 frame = bayer_to_rgb(frame_buffer, FRAME_WIDTH, FRAME_HEIGHT)
-                out.write(frame)
-                cv2.imshow('Pixy2 Raw Frame', frame)
-                cv2.waitKey(1)
+                if recording:
+                    out.write(frame)
+                if CONFIG['video']['show_preview']:
+                    cv2.imshow('Pixy2 Raw Frame', frame)
+                    # Handle OpenCV window input
+                    key = cv2.waitKey(1) & 0xFF
+                    if key != 255:  # Key was pressed
+                        if key == ord('q'):
+                            break
+                        elif key == ord('r'):
+                            recording = not recording
+                            if recording:
+                                video_path = get_video_path()
+                                out = cv2.VideoWriter(video_path, 
+                                                   cv2.VideoWriter_fourcc(*CONFIG['video']['codec']), 
+                                                   CONFIG['video']['fps'], 
+                                                   (FRAME_WIDTH, FRAME_HEIGHT))
+                                print(f"Started recording to: {video_path}")
+                            else:
+                                out.release()
+                                print(f"Stopped recording: {video_path}")
+                        elif key == ord('p'):
+                            CONFIG['video']['show_preview'] = False
+                            cv2.destroyAllWindows()
+                        else:
+                            # Handle pan/tilt commands
+                            target_pan, target_tilt = handle_key_event(key, target_pan, target_tilt)
+                frames_processed += 1
 
             # Update movement at fixed interval
             current_time = time.time()
@@ -194,13 +514,31 @@ def main():
                 new_tilt = tilt_controller.update(tilt_error)
 
                 try:
-                    pixy.set_servos(int(new_pan), int(new_tilt))
+                    with suppress_stdout_stderr():
+                        pixy.set_servos(int(new_pan), int(new_tilt))
                     current_pan = new_pan
                     current_tilt = new_tilt
-                    print(f"\rCurrent position - Pan: {current_pan:.0f}, Tilt: {current_tilt:.0f}", end='')
-                    sys.stdout.flush()
+                    
+                    # Calculate FPS
+                    elapsed_time = current_time - start_time
+                    fps = frames_processed / elapsed_time if elapsed_time > 0 else 0
+                    
+                    # Update status display
+                    status = f"[{'REC' if recording else 'PAUSE'}] "
+                    status += f"Pan: {current_pan:4.0f} Tilt: {current_tilt:4.0f}"
+                    if CONFIG['debug']['show_fps']:
+                        status += f" FPS: {fps:4.1f}"
+                    if recording:
+                        status += f" → {os.path.basename(video_path)}"
+                    terminal.update_status(status)
+                    
+                    # Log detailed status to file only
+                    logging.debug(f"Status - Pan: {current_pan:.2f}, Tilt: {current_tilt:.2f}, "
+                                f"FPS: {fps:.2f}, Recording: {recording}")
+                    
                 except Exception as e:
-                    print("\nError updating servos:", str(e))
+                    logging.error(f"Error updating servos: {str(e)}")
+                    terminal.show_message("Error updating servos. Check log file for details.")
 
                 last_update = current_time
 
@@ -208,29 +546,53 @@ def main():
             time.sleep(0.001)
 
     except KeyboardInterrupt:
-        print("\nExiting...")
+        terminal.show_message("Exiting...")
     except Exception as e:
-        print("\nError occurred:", str(e))
+        logging.error(f"Error occurred: {str(e)}")
+        terminal.show_message("Error occurred. Check log file for details.")
 
     finally:
-        # Cleanup
+        # First, cleanup video resources
+        if 'out' in locals():
+            out.release()
+        cv2.destroyAllWindows()
+
+        # Calculate final statistics
+        elapsed_time = time.time() - start_time
+        fps = frames_processed/elapsed_time if elapsed_time > 0 else 0
+        
+        # Suppress all Pixy2-related cleanup operations
+        with suppress_stdout_stderr():
+            try:
+                # Center the servos before exiting
+                pixy.set_servos(int(PIXY_RCS_CENTER_POSITION), int(PIXY_RCS_CENTER_POSITION))
+                
+                # Resume Pixy2 program
+                pixy.resume()
+                
+                # Small delay to ensure commands are processed
+                time.sleep(0.05)
+            except Exception as e:
+                logging.error(f"Error during Pixy2 cleanup: {str(e)}")
+
+        # Restore terminal
         restore_terminal(fd, old_settings)
         
-        # Resume Pixy2 program
-        pixy.resume()
+        # Print final status with a small delay to let any pending output finish
+        time.sleep(0.1)  # Short delay
+        sys.stdout.flush()  # Flush any pending output
         
-        # Center the servos before exiting
-        print("\nCentering servos...")
-        try:
-            pixy.set_servos(int(PIXY_RCS_CENTER_POSITION), int(PIXY_RCS_CENTER_POSITION))
-            print("Servos centered successfully!")
-        except Exception as e:
-            print("Error centering servos:", str(e))
+        # Use ANSI escape sequences to clear from cursor to end of screen
+        print("\033[J", end='')
         
-        # Cleanup video resources
-        out.release()
-        cv2.destroyAllWindows()
-        print("Saved video to output.avi")
+        # Print final status
+        print("\nFinal Status:")
+        print(f"Duration: {elapsed_time:.1f} seconds")
+        print(f"Frames Processed: {frames_processed}")
+        print(f"Average FPS: {fps:.1f}")
+        if recording:
+            print(f"Last Recording: {video_path}")
+        print("\nSession completed. Check log file for detailed statistics.")
 
 if __name__ == "__main__":
     main() 
