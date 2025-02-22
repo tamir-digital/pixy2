@@ -23,10 +23,10 @@ uname -a
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Use local build directory instead of project root
-TARGET_BUILD_FOLDER="build"
+TARGET_BUILD_FOLDER="../build"  # Original location relative to scripts dir
 
 # Create build directory in current working directory with full path
-BUILD_DIR="$SCRIPT_DIR/$TARGET_BUILD_FOLDER/python_demos"
+BUILD_DIR="$SCRIPT_DIR/../../build/python_demos"  # Proper path from scripts -> project root
 mkdir -p "$BUILD_DIR" || { 
     RED_TEXT
     echo "Failed to create build directory at $BUILD_DIR"
