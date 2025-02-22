@@ -275,7 +275,7 @@ def setup_logging():
         def clear_screen(self):
             """Clear the terminal screen"""
             if not self._suppress_output:
-                os.system('clear' if os.name == 'posix' else 'cls')
+                print('\033[2J\033[H', end='', flush=True)  # Clear screen and move cursor to home
             self.interface_shown = False
             
         def show_interface(self, log_file):
@@ -283,38 +283,39 @@ def setup_logging():
             if not self.interface_shown and not self._suppress_output:
                 self.clear_screen()
                 lines = [
-                    "\n=== Pixy2 Video Servo Control ===",
-                    f"Session log: {os.path.basename(log_file)}",
-                    "\nControls (work in both terminal and video window):",
-                    "a/d : Pan left/right",
-                    "w/s : Tilt up/down",
-                    "c   : Center servos",
-                    "r   : Toggle recording",
-                    "p   : Toggle preview",
-                    "q   : Quit",
-                    "\nStatus:",
-                    ""  # Empty line for status updates
+                    "\r=== Pixy2 Video Servo Control ===",
+                    f"\rSession log: {os.path.basename(log_file)}",
+                    "\r",
+                    "\rControls (work in both terminal and video window):",
+                    "\r  a/d : Pan left/right",
+                    "\r  w/s : Tilt up/down", 
+                    "\r  c   : Center servos",
+                    "\r  r   : Toggle recording",
+                    "\r  p   : Toggle preview",
+                    "\r  q   : Quit",
+                    "\r",
+                    "\rStatus:"
                 ]
-                print('\n'.join(lines))
+                print('\n'.join(lines), flush=True)
                 self.interface_shown = True
                 
         def update_status(self, status):
             """Update the status line"""
             if not self._suppress_output:
                 if self.status_line:
-                    # Move up one line and clear it
-                    print('\033[F\033[K', end='', flush=True)
-                print(status, flush=True)
+                    # Move up one line, to left margin, and clear line
+                    print('\033[F\r\033[K', end='', flush=True)
+                print('\r' + status, flush=True)
                 self.status_line = status
             
         def show_message(self, message):
             """Show a temporary message without disturbing status"""
             if not self._suppress_output:
                 if self.status_line:
-                    # Save cursor position, move up one line, show message, restore position
-                    print(f'\033[s\033[F\033[K{message}\033[u', end='', flush=True)
+                    # Save cursor, move up and left, clear line, show message, restore position
+                    print(f'\033[s\033[F\r\033[K{message}\033[u', end='', flush=True)
                 else:
-                    print(message, flush=True)
+                    print('\r' + message, flush=True)
 
     return log_file, TerminalHandler()
 
@@ -526,13 +527,13 @@ def main():
                     elapsed_time = current_time - start_time
                     fps = frames_processed / elapsed_time if elapsed_time > 0 else 0
                     
-                    # Update status display
-                    status = f"[{'REC' if recording else 'PAUSE'}] "
-                    status += f"Pan: {current_pan:4.0f} Tilt: {current_tilt:4.0f}"
+                    # Update status display with fixed-width formatting
+                    status = f"[{('REC' if recording else 'PAUSE'):4s}] "
+                    status += f"Pan: {int(current_pan):4d} Tilt: {int(current_tilt):4d}"
                     if CONFIG['debug']['show_fps']:
-                        status += f" FPS: {fps:4.1f}"
+                        status += f" FPS: {fps:5.1f}"
                     if recording:
-                        status += f" → {os.path.basename(video_path)}"
+                        status += f"  →  {os.path.basename(video_path)}"
                     terminal.update_status(status)
                     
                     # Log detailed status to file only
