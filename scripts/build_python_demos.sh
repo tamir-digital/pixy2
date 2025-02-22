@@ -23,27 +23,40 @@ uname -a
 
 TARGET_BUILD_FOLDER=../build
 
-mkdir $TARGET_BUILD_FOLDER
-mkdir $TARGET_BUILD_FOLDER/python_demos
+mkdir -p $TARGET_BUILD_FOLDER/python_demos || { echo "Failed to create build directory"; exit 1; }
 
-cd ../src/host/libpixyusb2_examples/python_demos
+cd ../src/host/libpixyusb2_examples/python_demos || { echo "Failed to enter source directory"; exit 1; }
 
-swig -c++ -python pixy.i
-python swig.dat build_ext --inplace -D__LINUX__
+# Clean previous build
+rm -f _pixy*.so pixy.py pixy_wrap.cpp
 
-files=(../../../../build/python_demos/*.so)
-if (( ${#files[@]} )); then
-  rm ../../../../build/python_demos/*.so
-fi
+# Generate SWIG wrapper
+swig -c++ -python pixy.i || { RED_TEXT; echo "SWIG failed"; exit 1; }
 
-cp * ../../../../build/python_demos
+# Build extension module
+python swig.dat build_ext --inplace -D__LINUX__ > build.log 2>&1 || { 
+    RED_TEXT
+    echo "Build failed - see build.log"
+    cat build.log
+    exit 1
+}
 
-files=(../../../../build/python_demos/*.so)
+# Copy only the necessary files
+cp pixy.py _pixy*.so ../../../../build/python_demos || { RED_TEXT; echo "Failed to copy build artifacts"; exit 1; }
+
+# Verify build output
+files=(../../../../build/python_demos/_pixy*.so)
 if (( ${#files[@]} )); then
   GREEN_TEXT
-  printf "SUCCESS "
+  echo "SUCCESS: Built ${#files[@]} .so files"
+  echo "Build artifacts:"
+  ls -l ../../../../build/python_demos
 else
   RED_TEXT
-  printf "FAILURE "
+  echo "FAILURE: No .so files were built"
+  echo "Build output:"
+  cat build.log
+  exit 1
 fi
-echo ""
+
+NORMAL_TEXT
