@@ -21,6 +21,9 @@ NORMAL_TEXT
 
 uname -a
 
+# Get absolute path to script directory first
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Use local build directory instead of project root
 TARGET_BUILD_FOLDER="build"
 
@@ -31,9 +34,6 @@ mkdir -p "$BUILD_DIR" || {
     echo "Failed to create build directory at $BUILD_DIR"
     exit 1 
 }
-
-# Get absolute path to script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT/src/host/libpixyusb2_examples/python_demos" || { 
