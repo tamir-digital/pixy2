@@ -17,6 +17,17 @@ WHITE_TEXT
 echo "########################################################################################"
 echo "# Building Python (SWIG) Demos...                                                      #"
 echo "########################################################################################"
+# Create a test runner script
+TEST_RUNNER="$BUILD_DIR/run_demos.sh"
+echo "#!/bin/bash" > "$TEST_RUNNER"
+echo "export PYTHONPATH=\"$BUILD_DIR\"" >> "$TEST_RUNNER"
+echo "echo 'Available demos:'" >> "$TEST_RUNNER"
+echo "ls $BUILD_DIR/*.py | grep -v pixy.py" >> "$TEST_RUNNER"
+echo "echo 'To run a demo, use: python3 -m demo_name (without .py)'" >> "$TEST_RUNNER"
+chmod +x "$TEST_RUNNER"
+
+GREEN_TEXT
+echo "Created test runner: $TEST_RUNNER"
 NORMAL_TEXT
 
 uname -a
