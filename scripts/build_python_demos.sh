@@ -21,11 +21,20 @@ NORMAL_TEXT
 
 uname -a
 
-TARGET_BUILD_FOLDER=../build
+TARGET_BUILD_FOLDER="$PROJECT_ROOT/build"
 
 mkdir -p $TARGET_BUILD_FOLDER/python_demos || { echo "Failed to create build directory"; exit 1; }
 
-cd ../src/host/libpixyusb2_examples/python_demos || { echo "Failed to enter source directory"; exit 1; }
+# Get absolute path to script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$PROJECT_ROOT/src/host/libpixyusb2_examples/python_demos" || { 
+    RED_TEXT
+    echo "Failed to enter source directory: $PROJECT_ROOT/src/host/libpixyusb2_examples/python_demos"
+    echo "Please ensure the Pixy2 repository is properly cloned with all subdirectories"
+    exit 1
+}
 
 # Clean previous build
 rm -f _pixy*.so pixy.py pixy_wrap.cpp
@@ -42,10 +51,10 @@ python swig.dat build_ext --inplace -D__LINUX__ > build.log 2>&1 || {
 }
 
 # Copy only the necessary files
-cp pixy.py _pixy*.so ../../../../build/python_demos || { RED_TEXT; echo "Failed to copy build artifacts"; exit 1; }
+cp pixy.py _pixy*.so "$TARGET_BUILD_FOLDER/python_demos" || { RED_TEXT; echo "Failed to copy build artifacts"; exit 1; }
 
 # Verify build output
-files=(../../../../build/python_demos/_pixy*.so)
+files=("$TARGET_BUILD_FOLDER/python_demos/_pixy*.so")
 if (( ${#files[@]} )); then
   GREEN_TEXT
   echo "SUCCESS: Built ${#files[@]} .so files"
