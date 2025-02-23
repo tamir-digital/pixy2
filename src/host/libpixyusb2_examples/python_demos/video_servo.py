@@ -58,6 +58,12 @@ DEFAULT_CONFIG = {
             "max_limit": 2000,     # Maximum integral accumulation
             "min_limit": -2000,    # Minimum integral accumulation
             "anti_windup": True    # Enable back-calculation anti-windup
+        },
+        "deadband": {
+            "enabled": True,
+            "error": 2.0,        # Ignore errors smaller than this
+            "output": 1.0,       # Don't move if command change smaller than this
+            "integral_error": 0.5 # Smaller deadband for integral accumulation
         }
     },
     "debug": {
@@ -180,6 +186,13 @@ class PID_Controller:
         self.integral_min = float(integral_config.get('min_limit', PID_MINIMUM_INTEGRAL))
         self.anti_windup = integral_config.get('anti_windup', True)
         
+        # Get deadband configuration
+        deadband_config = CONFIG['servo'].get('deadband', {})
+        self.deadband_enabled = deadband_config.get('enabled', True)
+        self.error_deadband = float(deadband_config.get('error', 2.0))
+        self.output_deadband = float(deadband_config.get('output', 1.0))
+        self.integral_error_deadband = float(deadband_config.get('integral_error', 0.5))
+        
         # Safety checks
         if self.integral_gain == 0:
             self.integral_enabled = False
@@ -197,6 +210,12 @@ class PID_Controller:
         self.previous_command = self.command
         self.last_pid = 0.0  # Store last PID output for anti-windup
 
+    def apply_deadband(self, value, deadband):
+        """Apply deadband to a value"""
+        if abs(value) <= deadband:
+            return 0.0
+        return value
+
     def update(self, error):
         current_time = time.time()
         
@@ -206,23 +225,27 @@ class PID_Controller:
             if dt <= 0:  # Avoid division by zero or negative time
                 dt = UPDATE_INTERVAL
             
+            # Apply error deadband if enabled
+            working_error = error
+            if self.deadband_enabled:
+                working_error = self.apply_deadband(error, self.error_deadband)
+            
             # Calculate PID terms with float math
-            p_term = error * self.proportion_gain
+            p_term = working_error * self.proportion_gain
             
             # Enhanced integral term with time-based integration and decay
             if self.integral_enabled and self.integral_gain != 0:  # Extra safety check
                 # Apply decay to existing integral
                 self.integral_value *= self.integral_decay
                 
-                # Time-based integration
-                self.integral_value += error * dt
+                # Time-based integration (using smaller deadband for integral)
+                integral_error = working_error if not self.deadband_enabled else self.apply_deadband(working_error, self.integral_error_deadband)
+                self.integral_value += integral_error * dt
                 
                 # Anti-windup using clamping and back-calculation
                 if self.anti_windup:
                     if self.command != self.previous_command:
-                        # Calculate how much of the change was actually applied
                         command_delta = self.command - self.previous_command
-                        # If we're limited, scale back the integral
                         if abs(command_delta) < abs(self.last_pid):
                             windup_scale = 0.9  # Reduce integral by 10% when limited
                             self.integral_value *= windup_scale
@@ -234,8 +257,14 @@ class PID_Controller:
             else:
                 i_term = 0.0
             
-            # Time-based derivative
-            d_term = ((error - self.previous_error) / dt) * self.derivative_gain
+            # Time-based derivative (using main error deadband)
+            if self.previous_error is not None:
+                prev_working_error = self.previous_error
+                if self.deadband_enabled:
+                    prev_working_error = self.apply_deadband(self.previous_error, self.error_deadband)
+                d_term = ((working_error - prev_working_error) / dt) * self.derivative_gain
+            else:
+                d_term = 0.0
             
             # Combine terms
             pid = p_term + i_term + d_term
@@ -243,12 +272,21 @@ class PID_Controller:
             
             if self.debug:
                 logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, "
-                            f"Total: {pid:.4f}, dt: {dt:.4f}, Integral: {self.integral_value:.4f}")
+                            f"Total: {pid:.4f}, dt: {dt:.4f}, Integral: {self.integral_value:.4f}, "
+                            f"Error: {error:.1f}, Working Error: {working_error:.1f}")
             
             if self.servo:
                 self.previous_command = self.command
-                # Update command with float math but return as integer
-                self.command = min(max(self.command + pid, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
+                # Calculate new command
+                new_command = self.command + pid
+                
+                # Apply output deadband if enabled
+                if self.deadband_enabled:
+                    if abs(new_command - self.command) <= self.output_deadband:
+                        new_command = self.command
+                
+                # Apply limits and convert to integer
+                self.command = min(max(new_command, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
         
         self.previous_error = float(error)
         self.previous_time = current_time
