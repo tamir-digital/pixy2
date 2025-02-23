@@ -304,11 +304,20 @@ class PID_Controller:
 
     def set_target(self, new_target):
         """Set a new target position with motion profile"""
-        if self.motion.enabled and abs(new_target - self.target_position) > self.error_deadband:
-            # Start a new motion profile for significant changes
+        # Calculate step size
+        step_size = abs(new_target - self.target_position)
+        
+        # Only use motion profile for significant changes
+        if self.motion.enabled and step_size > self.error_deadband:
+            # Start a new motion profile from current command to new target
             self.motion.start_move(self.command, new_target)
             if self.debug:
-                logging.debug(f"Starting profiled move to {new_target:.1f}")
+                logging.debug(f"Starting profiled move: {self.command:.1f} → {new_target:.1f}")
+        else:
+            # Small change, update target directly
+            if self.debug:
+                logging.debug(f"Direct target update: {self.target_position:.1f} → {new_target:.1f}")
+        
         self.target_position = new_target
 
     def apply_deadband(self, value, deadband):
@@ -325,10 +334,15 @@ class PID_Controller:
             # Get next position from profile
             profile_pos = self.motion.update()
             if profile_pos is not None:
-                # Calculate error to profile position
+                # Use profile position as intermediate target
                 error = profile_pos - self.command
                 if self.debug:
-                    logging.debug(f"Profile active - pos: {profile_pos:.1f}, error: {error:.1f}")
+                    logging.debug(f"Profile active - target: {profile_pos:.1f}, error: {error:.1f}")
+            else:
+                # Profile completed, use final target
+                error = self.target_position - self.command
+                if self.debug:
+                    logging.debug(f"Profile complete - target: {self.target_position:.1f}, error: {error:.1f}")
         
         if self.previous_error is not None and self.previous_time is not None:
             # Calculate time delta
