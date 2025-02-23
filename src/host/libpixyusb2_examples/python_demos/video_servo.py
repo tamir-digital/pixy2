@@ -56,7 +56,8 @@ DEFAULT_CONFIG = {
     "debug": {
         "log_level": "INFO",
         "show_fps": True,
-        "suppress_pixy_debug": True  # New option to control Pixy debug output
+        "suppress_pixy_debug": True,  # New option to control Pixy debug output
+        "pid_debug": False  # New option for PID debug output
     }
 }
 
@@ -157,28 +158,43 @@ UPDATE_INTERVAL = CONFIG['servo']['update_interval']
 
 class PID_Controller:
     def __init__(self, proportion_gain, integral_gain, derivative_gain, servo):
-        self.proportion_gain = proportion_gain
-        self.integral_gain = integral_gain
-        self.derivative_gain = derivative_gain
+        # Convert gains to float equivalents of the bit-shifted values
+        self.proportion_gain = float(proportion_gain) / 1024.0  # Equivalent of >> 10
+        self.integral_gain = float(integral_gain) / 16384.0    # Equivalent of >> 14 (>> 10 and >> 4)
+        self.derivative_gain = float(derivative_gain) / 1024.0 # Equivalent of >> 10
         self.servo = servo
+        # Add debug logging flag
+        self.debug = CONFIG['debug'].get('pid_debug', False)
         self.reset()
 
     def reset(self):
-        self.previous_error = 0x80000000
-        self.integral_value = 0
-        self.command = PIXY_RCS_CENTER_POSITION if self.servo else 0
+        self.previous_error = None  # Using None instead of magic number
+        self.integral_value = 0.0   # Using float
+        self.command = float(PIXY_RCS_CENTER_POSITION if self.servo else 0)
 
     def update(self, error):
-        if self.previous_error != 0x80000000:
-            self.integral_value = self.integral_value + error
-            self.integral_value = min(max(self.integral_value, PID_MINIMUM_INTEGRAL), PID_MAXIMUM_INTEGRAL)
-            pid = int(error * self.proportion_gain + 
-                     (int(self.integral_value * self.integral_gain) >> 4) + 
-                     (error - self.previous_error) * self.derivative_gain) >> 10
+        if self.previous_error is not None:
+            # Update integral with float
+            self.integral_value = float(self.integral_value + error)
+            self.integral_value = min(max(self.integral_value, float(PID_MINIMUM_INTEGRAL)), float(PID_MAXIMUM_INTEGRAL))
+            
+            # Calculate PID terms with float math
+            p_term = error * self.proportion_gain
+            i_term = self.integral_value * self.integral_gain
+            d_term = (error - self.previous_error) * self.derivative_gain
+            
+            # Combine terms
+            pid = p_term + i_term + d_term
+            
+            if self.debug:
+                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, Total: {pid:.4f}")
+            
             if self.servo:
-                self.command = min(max(self.command + pid, PIXY_RCS_MINIMUM_POSITION), PIXY_RCS_MAXIMUM_POSITION)
-        self.previous_error = error
-        return self.command
+                # Update command with float math but return as integer
+                self.command = min(max(self.command + pid, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
+        
+        self.previous_error = float(error)
+        return int(round(self.command))  # Convert to integer for servo
 
 def is_data():
     """Check if there is data waiting on stdin"""
@@ -337,9 +353,9 @@ def handle_key_event(key, target_pan, target_tilt):
         return max(PIXY_RCS_MINIMUM_POSITION, target_pan - PAN_STEP), target_tilt
     elif key in [ord('d'), ord('D')]:  # right
         return min(PIXY_RCS_MAXIMUM_POSITION, target_pan + PAN_STEP), target_tilt
-    elif key in [ord('w'), ord('W')]:  # up
+    elif key in [ord('s'), ord('S')]:  # up
         return target_pan, min(PIXY_RCS_MAXIMUM_POSITION, target_tilt + TILT_STEP)
-    elif key in [ord('s'), ord('S')]:  # down
+    elif key in [ord('w'), ord('W')]:  # down
         return target_pan, max(PIXY_RCS_MINIMUM_POSITION, target_tilt - TILT_STEP)
     elif key in [ord('c'), ord('C')]:  # center
         return PIXY_RCS_CENTER_POSITION, PIXY_RCS_CENTER_POSITION
