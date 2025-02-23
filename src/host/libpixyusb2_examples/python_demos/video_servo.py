@@ -129,6 +129,23 @@ DEFAULT_CONFIG = {
                 "enabled": True,
                 "factor": 0.8,    # Higher smoothing (0-1)
                 "window": 3       # Number of samples for smoothing
+            },
+            "phases": {
+                "accelerating": {
+                    "smoothing": 0.8,
+                    "min_duration": 0.1,  # Minimum time in acceleration phase
+                    "accel_scale": 1.0
+                },
+                "sustained": {
+                    "smoothing": 0.2,
+                    "velocity_maintain_factor": 0.95,  # Maintain at least 95% of target velocity
+                    "accel_scale": 0.9
+                },
+                "decelerating": {
+                    "smoothing": 0.7,
+                    "min_duration": 0.05,  # Minimum deceleration time
+                    "accel_scale": 0.8
+                }
             }
         },
         "integral": {
@@ -293,12 +310,18 @@ movement_state = {
     'pan': {
         'velocity': 0.0,
         'last_update': 0,
-        'last_position': PIXY_RCS_CENTER_POSITION
+        'last_position': PIXY_RCS_CENTER_POSITION,
+        'movement_phase': 'idle',  # One of: idle, accelerating, sustained, decelerating
+        'phase_start_time': 0,
+        'initial_velocity': 0.0
     },
     'tilt': {
         'velocity': 0.0,
         'last_update': 0,
-        'last_position': PIXY_RCS_CENTER_POSITION
+        'last_position': PIXY_RCS_CENTER_POSITION,
+        'movement_phase': 'idle',
+        'phase_start_time': 0,
+        'initial_velocity': 0.0
     }
 }
 
@@ -1360,15 +1383,14 @@ def get_video_path():
 
 def calculate_velocity(current_velocity, target_velocity, dt):
     """
-    Calculate new velocity based on acceleration limits and smoothing.
+    Calculate new velocity with improved smoothing logic and better sustained movement.
     """
     global VELOCITY_SCALE
     velocity_config = CONFIG['servo']['velocity']
     max_accel = velocity_config['acceleration'] * VELOCITY_SCALE
     min_speed = velocity_config['min_speed']
-    smoothing_config = velocity_config.get('smoothing', {})
     
-    # Scale target velocity by global scale factor
+    # Scale target velocity
     scaled_target = target_velocity * VELOCITY_SCALE
     
     # Calculate maximum velocity change for this time step
@@ -1377,158 +1399,151 @@ def calculate_velocity(current_velocity, target_velocity, dt):
     # Calculate desired velocity change
     desired_delta = scaled_target - current_velocity
     
-    # Detect direction change
-    is_direction_change = (current_velocity * scaled_target < 0)
+    # Detect movement phase with more aggressive sustained threshold
+    is_accelerating = abs(current_velocity) < abs(scaled_target) * 0.95  # Increased from 0.8
+    is_sustained = abs(current_velocity) >= abs(scaled_target) * 0.95
     
-    # Add detailed diagnostic logging for slowdown investigation
-    if CONFIG['debug'].get('pid_debug', False):
-        active_keys = [k for k, v in key_states.items() if v['pressed']]
-        if active_keys:
-            logging.debug(
-                f"=== VELOCITY CALCULATION DIAGNOSTICS ===\n"
-                f"Active keys: {active_keys}\n"
-                f"Time metrics:\n"
-                f"  Current time: {time.time():.3f}\n"
-                f"  Key hold durations: {', '.join(f'{k}: {time.time() - key_states[k]['press_start']:.2f}s' for k in active_keys)}\n"
-                f"Velocity metrics:\n"
-                f"  Current velocity: {current_velocity:.2f}\n"
-                f"  Target velocity: {target_velocity:.2f}\n"
-                f"  Scaled target: {scaled_target:.2f}\n"
-                f"  Desired delta: {desired_delta:.2f}\n"
-                f"  Max delta: {max_delta:.2f}\n"
-                f"  Scale factor: {VELOCITY_SCALE:.2f}\n"
-                f"  Direction change: {is_direction_change}\n"
-                f"Thresholds:\n"
-                f"  Min speed: {min_speed:.2f}\n"
-                f"  Max accel: {max_accel:.2f}"
-            )
-    
-    # Special handling for direction changes
-    if is_direction_change:
-        # On direction change, apply stronger acceleration and reduced smoothing
-        direction = 1 if scaled_target > 0 else -1
-        # Start at 40% of target velocity in new direction
-        new_velocity = direction * abs(scaled_target) * 0.4
+    # Special handling for sustained movement to prevent slowdown
+    if is_sustained:
+        # During sustained movement, actively maintain target velocity
+        maintain_factor = velocity_config['phases']['sustained']['velocity_maintain_factor']
+        current_ratio = abs(current_velocity) / abs(scaled_target)
         
-        if CONFIG['debug'].get('pid_debug', False):
-            logging.debug(
-                f"Direction change handling:\n"
-                f"  Old velocity: {current_velocity:.2f}\n"
-                f"  Initial new velocity: {new_velocity:.2f}\n"
-                f"  Target: {scaled_target:.2f}"
-            )
+        if current_ratio < maintain_factor:
+            # If velocity has dropped below maintain factor, boost it back up
+            direction = 1 if scaled_target > 0 else -1
+            new_velocity = direction * abs(scaled_target)  # Snap directly to target
+            
+            if CONFIG['debug'].get('pid_debug', False):
+                logging.debug(
+                    f"Velocity maintenance activated:\n"
+                    f"  Ratio: {current_ratio:.3f} < {maintain_factor:.3f}\n"
+                    f"  Boosting: {current_velocity:.2f} → {new_velocity:.2f}"
+                )
+            return new_velocity
         
-        return new_velocity
-    
-    # Normal movement - calculate acceleration scale
-    if abs(desired_delta) > 0:
-        # For sustained movement, maintain target velocity
-        if abs(current_velocity) > 0 and abs(desired_delta) < 0.1:
-            new_velocity = current_velocity
-        else:
-            # Scale acceleration based on absolute distance from target
-            accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
-            
-            # Apply enhanced smoothing if enabled, but only during acceleration
-            if smoothing_config.get('enabled', True) and abs(current_velocity) < abs(scaled_target):
-                smoothing_factor = float(smoothing_config.get('factor', 0.8))
-                # Apply sigmoid-like smoothing to acceleration
-                accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
-            
-            # Apply smoothing to acceleration
-            smoothed_accel = max_delta * (0.2 + 0.8 * accel_scale)  # Never less than 20% acceleration
-            # Limit velocity change by smoothed acceleration
-            actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
-            new_velocity = current_velocity + actual_delta
-            
-            # If we're very close to target velocity, snap to it
-            if abs(new_velocity - scaled_target) < 0.1:
-                new_velocity = scaled_target
+        # For sustained movement, use minimal smoothing and high acceleration
+        smoothing_factor = 0.1  # Reduced from 0.2
+        accel_scale = 1.0  # Increased from 0.9
+    elif is_accelerating:
+        # Initial acceleration phase
+        smoothing_factor = velocity_config['phases']['accelerating']['smoothing']
+        accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
+        accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
     else:
-        # No change in velocity needed
-        new_velocity = current_velocity
+        # Transitional movement
+        smoothing_factor = 0.5
+        accel_scale = 0.7
     
-    # Apply minimum speed threshold to avoid tiny movements
+    # Calculate acceleration with reduced time-based decay for sustained movement
+    if is_sustained:
+        smoothing_decay = 1.0  # No decay during sustained movement
+    else:
+        smoothing_decay = np.exp(-dt / 0.1)  # Normal decay for other phases
+    
+    effective_smoothing = smoothing_factor * smoothing_decay
+    
+    # Apply smoothing to acceleration with higher minimum during sustained movement
+    min_accel_factor = 0.6 if is_sustained else 0.4  # Increased minimum acceleration factor
+    smoothed_accel = max_delta * (min_accel_factor + (1.0 - min_accel_factor) * accel_scale)
+    
+    # Limit velocity change
+    actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
+    new_velocity = current_velocity + actual_delta
+    
+    # More aggressive snapping to target velocity during sustained movement
+    if is_sustained:
+        snap_threshold = 0.02 if is_sustained else 0.05  # Tighter threshold for sustained
+        if abs(new_velocity - scaled_target) < abs(scaled_target) * snap_threshold:
+            new_velocity = scaled_target
+    
+    # Apply minimum speed threshold
     if abs(new_velocity) < min_speed:
         if abs(scaled_target) > 0:
-            # If we have a target, maintain minimum speed
             new_velocity = min_speed * (1 if scaled_target > 0 else -1)
         else:
-            # If no target, come to a stop
             new_velocity = 0.0
     
     # Enhanced debug logging
     if CONFIG['debug'].get('pid_debug', False):
         logging.debug(
-            f"Velocity calculation results:\n"
-            f"  Acceleration:\n"
-            f"    scale: {accel_scale if 'accel_scale' in locals() else 0.0:.3f}\n"
-            f"    smoothed: {smoothed_accel if 'smoothed_accel' in locals() else 0.0:.2f}\n"
-            f"    actual delta: {actual_delta if 'actual_delta' in locals() else 0.0:.2f}\n"
-            f"  Final velocity: {new_velocity:.2f}\n"
-            f"  Min speed applied: {abs(new_velocity) == min_speed and abs(scaled_target) > 0}"
+            f"Velocity calculation:\n"
+            f"  Phase: {'sustained' if is_sustained else 'accelerating' if is_accelerating else 'other'}\n"
+            f"  Current: {current_velocity:.2f} → Target: {scaled_target:.2f}\n"
+            f"  Smoothing: factor={smoothing_factor:.2f}, decay={smoothing_decay:.2f}\n"
+            f"  Acceleration: scale={accel_scale:.2f}, smoothed={smoothed_accel:.2f}\n"
+            f"  Delta: desired={desired_delta:.2f}, actual={actual_delta:.2f}\n"
+            f"  Result: {new_velocity:.2f}"
         )
     
     return new_velocity
 
 def update_movement_state(axis_state, target_velocity, dt):
     """
-    Update movement state for an axis (pan or tilt).
+    Update movement state with improved sustained movement handling.
     """
     # Store previous state for debugging
     prev_velocity = axis_state['velocity']
     prev_position = axis_state['last_position']
     prev_time = axis_state.get('last_update', time.time())
+    prev_phase = axis_state['movement_phase']
     
     # Calculate actual time delta
     current_time = time.time()
     actual_dt = current_time - prev_time
     
-    # Track state transitions
-    state_changed = (
-        (prev_velocity == 0 and target_velocity != 0) or  # Starting movement
-        (prev_velocity != 0 and target_velocity == 0) or  # Stopping movement
-        (prev_velocity * target_velocity < 0)             # Direction change
-    )
-    
-    # Add detailed movement state logging
-    if CONFIG['debug'].get('pid_debug', False):
-        logging.debug(
-            f"Movement state update starting:\n"
-            f"  Previous state:\n"
-            f"    velocity: {prev_velocity:.2f}\n"
-            f"    position: {prev_position:.2f}\n"
-            f"    time: {prev_time:.3f}\n"
-            f"  Current parameters:\n"
-            f"    target velocity: {target_velocity:.2f}\n"
-            f"    dt (requested): {dt:.4f}\n"
-            f"    dt (actual): {actual_dt:.4f}\n"
-            f"  State transition: {state_changed}"
-        )
-    
-    # Immediately reset velocity if target is zero
+    # More aggressive phase detection for sustained movement
     if target_velocity == 0:
+        new_phase = 'decelerating' if abs(prev_velocity) > 0 else 'idle'
+    elif abs(prev_velocity) >= abs(target_velocity) * 0.95:  # Increased from 0.8
+        new_phase = 'sustained'
+    else:
+        new_phase = 'accelerating'
+    
+    # Handle phase transitions with priority for sustained movement
+    if new_phase != prev_phase:
+        phase_config = CONFIG['servo']['velocity']['phases'].get(new_phase, {})
+        min_duration = phase_config.get('min_duration', 0)
+        phase_duration = current_time - axis_state['phase_start_time']
+        
+        # More permissive transition to sustained phase
+        should_transition = (
+            new_phase == 'idle' or
+            prev_phase == 'idle' or
+            new_phase == 'sustained' or  # Always allow transition to sustained
+            phase_duration >= min_duration
+        )
+        
+        if should_transition:
+            axis_state['movement_phase'] = new_phase
+            axis_state['phase_start_time'] = current_time
+            if new_phase == 'accelerating':
+                axis_state['initial_velocity'] = prev_velocity
+            
+            if CONFIG['debug'].get('pid_debug', False):
+                logging.debug(
+                    f"Movement phase transition:\n"
+                    f"  {prev_phase} → {new_phase}\n"
+                    f"  Previous phase duration: {phase_duration:.3f}s\n"
+                    f"  Velocity: {prev_velocity:.2f}\n"
+                    f"  Target: {target_velocity:.2f}"
+                )
+    
+    # Calculate phase duration
+    phase_duration = current_time - axis_state['phase_start_time']
+    
+    # Update velocity with phase awareness
+    if target_velocity == 0 and new_phase == 'idle':
         axis_state['velocity'] = 0.0
         new_velocity = 0.0
     else:
-        # Update velocity with detailed logging
+        # Calculate new velocity
         new_velocity = calculate_velocity(
-            axis_state['velocity'],
+            prev_velocity,
             target_velocity,
             dt
         )
         axis_state['velocity'] = new_velocity
-    
-    velocity_change = new_velocity - prev_velocity
-    
-    if CONFIG['debug'].get('pid_debug', False) and abs(velocity_change) > 0.1:
-        logging.debug(
-            f"Significant velocity change detected:\n"
-            f"  Previous: {prev_velocity:.2f}\n"
-            f"  New: {new_velocity:.2f}\n"
-            f"  Change: {velocity_change:+.2f}\n"
-            f"  Target: {target_velocity:.2f}"
-        )
     
     # Calculate position change
     position_delta = axis_state['velocity'] * dt
@@ -1539,28 +1554,13 @@ def update_movement_state(axis_state, target_velocity, dt):
     axis_state['last_update'] = current_time
     
     if CONFIG['debug'].get('pid_debug', False):
-        if state_changed:
+        if abs(new_velocity - prev_velocity) > 0.1 or abs(position_delta) > 0.1:
             logging.debug(
-                f"Movement state transition:\n"
-                f"  Type: {get_transition_type(prev_velocity, target_velocity)}\n"
-                f"  Timing:\n"
-                f"    dt (requested): {dt:.4f}\n"
-                f"    dt (actual): {actual_dt:.4f}\n"
-                f"  Velocity:\n"
-                f"    previous: {prev_velocity:.2f}\n"
-                f"    target: {target_velocity:.2f}\n"
-                f"    new: {axis_state['velocity']:.2f}\n"
-                f"  Position:\n"
-                f"    previous: {prev_position:.1f}\n"
-                f"    delta: {position_delta:+.1f}\n"
-                f"    new: {new_position:.1f}"
-            )
-        elif abs(velocity_change) > 0.1 or abs(position_delta) > 0.1:
-            logging.debug(
-                f"Movement state update (significant change):\n"
+                f"Movement state update:\n"
+                f"  Phase: {axis_state['movement_phase']} (duration: {phase_duration:.3f}s)\n"
                 f"  Position: {prev_position:.1f} → {new_position:.1f} (Δ{position_delta:+.1f})\n"
-                f"  Velocity: {prev_velocity:.1f} → {axis_state['velocity']:.1f} (Δ{velocity_change:+.1f})\n"
-                f"  Target velocity: {target_velocity:.1f}\n"
+                f"  Velocity: {prev_velocity:.2f} → {new_velocity:.2f}\n"
+                f"  Target velocity: {target_velocity:.2f}\n"
                 f"  dt: {dt:.4f}"
             )
     
