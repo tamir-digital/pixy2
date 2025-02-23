@@ -161,19 +161,27 @@ class PID_Controller:
         # Convert gains to float equivalents of the bit-shifted values
         self.proportion_gain = float(proportion_gain) / 1024.0  # Equivalent of >> 10
         self.integral_gain = float(integral_gain) / 16384.0    # Equivalent of >> 14 (>> 10 and >> 4)
-        self.derivative_gain = float(derivative_gain) / 1024.0 # Equivalent of >> 10
+        # Scale derivative gain to match old behavior at 60Hz
+        self.derivative_gain = float(derivative_gain) / 1024.0 * UPDATE_INTERVAL  # Scale for time-based calculation
         self.servo = servo
-        # Add debug logging flag
         self.debug = CONFIG['debug'].get('pid_debug', False)
         self.reset()
 
     def reset(self):
-        self.previous_error = None  # Using None instead of magic number
-        self.integral_value = 0.0   # Using float
+        self.previous_error = None
+        self.previous_time = None
+        self.integral_value = 0.0
         self.command = float(PIXY_RCS_CENTER_POSITION if self.servo else 0)
 
     def update(self, error):
-        if self.previous_error is not None:
+        current_time = time.time()
+        
+        if self.previous_error is not None and self.previous_time is not None:
+            # Calculate time delta
+            dt = current_time - self.previous_time
+            if dt <= 0:  # Avoid division by zero or negative time
+                dt = UPDATE_INTERVAL
+            
             # Update integral with float
             self.integral_value = float(self.integral_value + error)
             self.integral_value = min(max(self.integral_value, float(PID_MINIMUM_INTEGRAL)), float(PID_MAXIMUM_INTEGRAL))
@@ -181,19 +189,21 @@ class PID_Controller:
             # Calculate PID terms with float math
             p_term = error * self.proportion_gain
             i_term = self.integral_value * self.integral_gain
-            d_term = (error - self.previous_error) * self.derivative_gain
+            # Time-based derivative (Δerror/Δtime)
+            d_term = ((error - self.previous_error) / dt) * self.derivative_gain
             
             # Combine terms
             pid = p_term + i_term + d_term
             
             if self.debug:
-                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, Total: {pid:.4f}")
+                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, Total: {pid:.4f}, dt: {dt:.4f}")
             
             if self.servo:
                 # Update command with float math but return as integer
                 self.command = min(max(self.command + pid, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
         
         self.previous_error = float(error)
+        self.previous_time = current_time
         return int(round(self.command))  # Convert to integer for servo
 
 def is_data():
