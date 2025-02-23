@@ -21,6 +21,64 @@ import fcntl
 import platform
 import atexit
 
+"""
+Movement System Architecture
+==========================
+
+Overview
+--------
+The movement system provides smooth, precise servo control through a multi-layered approach:
+
+Core Components
+--------------
+1. PID Controller (PID_Controller class)
+   - Handles precise positioning and error correction
+   - Features anti-windup and deadband handling
+   - Configurable gains and limits
+   - Integrates with motion profiling
+
+2. Motion Profile Generator (MotionProfile class)
+   - Generates smooth acceleration/deceleration curves
+   - S-curve profiling for smooth transitions
+   - Configurable smoothing and duration
+   - Prevents mechanical stress through controlled motion
+
+3. Velocity Control System
+   - Manages speed and acceleration limits
+   - Provides natural-feeling motion
+   - Handles both manual control and automated movements
+   - Smoothing and minimum speed thresholds
+
+Movement State Management
+-----------------------
+- Key state tracking for user input
+- Separate pan/tilt movement states
+- Velocity and position history
+- Configurable update intervals
+
+Configuration System
+------------------
+The movement system is highly configurable through the CONFIG dictionary:
+- PID gains and limits
+- Motion profile parameters
+- Velocity and acceleration limits
+- Smoothing factors
+- Debug options
+
+Data Flow
+---------
+1. User Input → Key State
+2. Key State → Target Velocity/Position
+3. Motion Profile → Smooth Position Trajectory
+4. PID Controller → Final Servo Commands
+
+This architecture ensures:
+- Smooth motion across different speeds
+- Precise positioning
+- Prevention of oscillation
+- Configurable behavior for different use cases
+"""
+
 # Permanently redirect stderr to /dev/null
 stderr_dev_null = open(os.devnull, 'w')
 os.dup2(stderr_dev_null.fileno(), sys.stderr.fileno())
@@ -38,6 +96,13 @@ if platform.system() == 'Darwin':
     os.environ['LIBUSB_DEBUG'] = '0'  # Disable libusb debug output
     os.environ['LIBUSB_LOG_LEVEL'] = '0'  # Set libusb log level to none
 
+# Constants
+PIXY_RCS_MAXIMUM_POSITION = 1000
+PIXY_RCS_MINIMUM_POSITION = 0
+PIXY_RCS_CENTER_POSITION = ((PIXY_RCS_MAXIMUM_POSITION - PIXY_RCS_MINIMUM_POSITION) / 2)
+PAN_STEP = 25
+TILT_STEP = 25
+
 # Default configuration
 DEFAULT_CONFIG = {
     "video": {
@@ -50,10 +115,22 @@ DEFAULT_CONFIG = {
         "pan_step": 25,
         "tilt_step": 25,
         "update_interval": 0.016,  # 60Hz
-        "pan_gain": 250,
-        "tilt_gain": 300,
+        "pan_gain": 200,          # Reduced from 250
+        "tilt_gain": 240,         # Reduced from 300
+        "velocity": {
+            "enabled": True,       # Enable velocity-based movement by default
+            "max_speed": 50,       # Reduced from 100 - units per second
+            "acceleration": 200,   # Reduced from 500 - units per second^2
+            "ramp_time": 0.3,     # Increased from 0.2 - Time to reach full speed
+            "min_speed": 2,       # Reduced from 5 - Minimum speed to maintain smooth motion
+            "smoothing": {
+                "enabled": True,
+                "factor": 0.8,    # Higher smoothing (0-1)
+                "window": 3       # Number of samples for smoothing
+            }
+        },
         "integral": {
-            "enabled": True,
+            "enabled": False,     # Disabled integral term
             "decay_factor": 0.98,
             "max_limit": 1000,
             "min_limit": -1000,
@@ -61,8 +138,8 @@ DEFAULT_CONFIG = {
         },
         "deadband": {
             "enabled": True,
-            "error": 3.0,
-            "output": 2.0,
+            "error": 2.0,        # Reduced from 3.0
+            "output": 1.5,       # Reduced from 2.0
             "integral_error": 1.0
         },
         "motion": {
@@ -71,12 +148,125 @@ DEFAULT_CONFIG = {
             "debug": False,        # Separate debug flag for motion profiling
             "acceleration": {
                 "enabled": True,   # Enable acceleration control
-                "max_accel": 5000, # Maximum acceleration (units/s^2)
-                "smoothing": 0.7   # Smoothing factor (0-1), higher = smoother
+                "max_accel": 1000, # Reduced from 5000 - Maximum acceleration
+                "smoothing": 0.85  # Increased from 0.7 - Smoothing factor
             },
             "velocity": {
-                "max": 2000,      # Maximum velocity (units/s)
-                "min": 100        # Minimum velocity for small movements
+                "max": 500,       # Reduced from 2000 - Maximum velocity
+                "min": 50         # Reduced from 100 - Minimum velocity
+            }
+        }
+    },
+    "movement_presets": {
+        "current": "balanced",  # Default preset
+        "presets": {
+            "smooth": {
+                "description": "Smooth, slower movements with high precision",
+                "servo": {
+                    "pan_gain": 180,
+                    "tilt_gain": 220,
+                    "velocity": {
+                        "max_speed": 30,
+                        "acceleration": 150,
+                        "ramp_time": 0.4,
+                        "min_speed": 1,
+                        "smoothing": {
+                            "factor": 0.9
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.15,
+                        "acceleration": {
+                            "max_accel": 800,
+                            "smoothing": 0.9
+                        }
+                    },
+                    "deadband": {
+                        "error": 1.5,
+                        "output": 1.0
+                    }
+                }
+            },
+            "responsive": {
+                "description": "Quick movements with less smoothing",
+                "servo": {
+                    "pan_gain": 220,
+                    "tilt_gain": 260,
+                    "velocity": {
+                        "max_speed": 70,
+                        "acceleration": 300,
+                        "ramp_time": 0.2,
+                        "min_speed": 3,
+                        "smoothing": {
+                            "factor": 0.7
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.08,
+                        "acceleration": {
+                            "max_accel": 1200,
+                            "smoothing": 0.7
+                        }
+                    },
+                    "deadband": {
+                        "error": 2.5,
+                        "output": 2.0
+                    }
+                }
+            },
+            "precise": {
+                "description": "High precision with balanced speed",
+                "servo": {
+                    "pan_gain": 200,
+                    "tilt_gain": 240,
+                    "velocity": {
+                        "max_speed": 40,
+                        "acceleration": 200,
+                        "ramp_time": 0.3,
+                        "min_speed": 1.5,
+                        "smoothing": {
+                            "factor": 0.85
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.12,
+                        "acceleration": {
+                            "max_accel": 1000,
+                            "smoothing": 0.85
+                        }
+                    },
+                    "deadband": {
+                        "error": 1.8,
+                        "output": 1.2
+                    }
+                }
+            },
+            "balanced": {
+                "description": "Default balanced behavior",
+                "servo": {
+                    "pan_gain": 200,
+                    "tilt_gain": 240,
+                    "velocity": {
+                        "max_speed": 50,
+                        "acceleration": 200,
+                        "ramp_time": 0.3,
+                        "min_speed": 2,
+                        "smoothing": {
+                            "factor": 0.8
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.1,
+                        "acceleration": {
+                            "max_accel": 1000,
+                            "smoothing": 0.85
+                        }
+                    },
+                    "deadband": {
+                        "error": 2.0,
+                        "output": 1.5
+                    }
+                }
             }
         }
     },
@@ -84,7 +274,29 @@ DEFAULT_CONFIG = {
         "log_level": "INFO",
         "show_fps": True,
         "suppress_pixy_debug": True,
-        "pid_debug": False
+        "pid_debug": True        # Enable PID debugging
+    }
+}
+
+# Global key state tracking
+key_states = {
+    'a': {'pressed': False, 'press_start': 0, 'velocity': 0.0, 'target_velocity': 0.0},
+    'd': {'pressed': False, 'press_start': 0, 'velocity': 0.0, 'target_velocity': 0.0},
+    'w': {'pressed': False, 'press_start': 0, 'velocity': 0.0, 'target_velocity': 0.0},
+    's': {'pressed': False, 'press_start': 0, 'velocity': 0.0, 'target_velocity': 0.0}
+}
+
+# Movement state tracking
+movement_state = {
+    'pan': {
+        'velocity': 0.0,
+        'last_update': 0,
+        'last_position': PIXY_RCS_CENTER_POSITION
+    },
+    'tilt': {
+        'velocity': 0.0,
+        'last_update': 0,
+        'last_position': PIXY_RCS_CENTER_POSITION
     }
 }
 
@@ -149,32 +361,139 @@ def suppress_stdout_stderr():
 def load_config():
     """Load configuration from file or create default"""
     config_path = os.path.join(os.path.dirname(__file__), 'video_servo_config.json')
+    
+    def deep_merge(source, destination):
+        """Deep merge two dictionaries, ensuring all keys are preserved"""
+        for key, value in source.items():
+            if key in destination:
+                if isinstance(value, dict) and isinstance(destination[key], dict):
+                    deep_merge(value, destination[key])
+                else:
+                    # Always take source value if not a dict
+                    destination[key] = value
+            else:
+                # Key not in destination, add it
+                destination[key] = value
+        return destination
+    
     try:
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
-                config = json.load(f)
-                # Merge with defaults to ensure all keys exist
-                merged = DEFAULT_CONFIG.copy()
-                merged.update(config)
+                loaded_config = json.load(f)
+                # Start with loaded config and merge defaults on top
+                merged = loaded_config.copy()
+                deep_merge(DEFAULT_CONFIG, merged)
                 return merged
         else:
             # Save default config
             with open(config_path, 'w') as f:
                 json.dump(DEFAULT_CONFIG, f, indent=4)
-            return DEFAULT_CONFIG
+            return DEFAULT_CONFIG.copy()
     except Exception as e:
         logging.warning(f"Error loading config, using defaults: {str(e)}")
-        return DEFAULT_CONFIG
+        return DEFAULT_CONFIG.copy()
 
 # Load configuration
 CONFIG = load_config()
 
-# Constants
-PIXY_RCS_MAXIMUM_POSITION = 1000
-PIXY_RCS_MINIMUM_POSITION = 0
-PIXY_RCS_CENTER_POSITION = ((PIXY_RCS_MAXIMUM_POSITION - PIXY_RCS_MINIMUM_POSITION) / 2)
-PAN_STEP = CONFIG['servo']['pan_step']
-TILT_STEP = CONFIG['servo']['tilt_step']
+def apply_movement_preset(preset_name, pan_controller=None, tilt_controller=None):
+    """
+    Apply a movement preset configuration.
+    
+    Args:
+        preset_name (str): Name of the preset to apply ('smooth', 'responsive', 'precise', 'balanced')
+        pan_controller (PID_Controller, optional): Pan axis controller to update
+        tilt_controller (PID_Controller, optional): Tilt axis controller to update
+        
+    Returns:
+        bool: True if preset was applied successfully, False otherwise
+    """
+    if preset_name not in CONFIG['movement_presets']['presets']:
+        logging.error(f"Unknown movement preset: {preset_name}")
+        return False
+    
+    try:
+        # Get preset configuration
+        preset = CONFIG['movement_presets']['presets'][preset_name]
+        
+        # Store previous state for logging
+        prev_preset = CONFIG['movement_presets']['current']
+        
+        # Deep merge servo configuration
+        def merge_config(source, dest):
+            """Deep merge while preserving existing keys"""
+            for key, value in source.items():
+                if key in dest and isinstance(value, dict) and isinstance(dest[key], dict):
+                    merge_config(value, dest[key])
+                else:
+                    dest[key] = value
+            return dest
+        
+        # Create a copy of the current servo config
+        new_servo_config = CONFIG['servo'].copy()
+        
+        # Merge preset servo config while preserving existing structure
+        merge_config(preset['servo'], new_servo_config)
+        
+        # Ensure velocity configuration is complete
+        if 'velocity' in new_servo_config:
+            # Preserve enabled state from current config
+            enabled_state = CONFIG['servo']['velocity'].get('enabled', True)
+            new_servo_config['velocity']['enabled'] = enabled_state
+        
+        # Update servo configuration
+        CONFIG['servo'].update(new_servo_config)
+        
+        # Update current preset
+        CONFIG['movement_presets']['current'] = preset_name
+        
+        # Update controllers if provided
+        if pan_controller is not None:
+            pan_controller.proportion_gain = float(CONFIG['servo']['pan_gain']) / 1024.0
+            pan_controller.derivative_gain = pan_controller.proportion_gain * UPDATE_INTERVAL
+            
+            # Reset integral term as gains changed
+            if pan_controller.integral_enabled:
+                pan_controller.integral_value = 0.0
+            
+            # Update deadband settings
+            pan_controller.error_deadband = float(CONFIG['servo']['deadband']['error'])
+            pan_controller.output_deadband = float(CONFIG['servo']['deadband']['output'])
+            
+            # Update motion profile
+            pan_controller.motion = MotionProfile(CONFIG['servo']['motion'])
+        
+        if tilt_controller is not None:
+            tilt_controller.proportion_gain = float(CONFIG['servo']['tilt_gain']) / 1024.0
+            tilt_controller.derivative_gain = tilt_controller.proportion_gain * UPDATE_INTERVAL
+            
+            # Reset integral term as gains changed
+            if tilt_controller.integral_enabled:
+                tilt_controller.integral_value = 0.0
+            
+            # Update deadband settings
+            tilt_controller.error_deadband = float(CONFIG['servo']['deadband']['error'])
+            tilt_controller.output_deadband = float(CONFIG['servo']['deadband']['output'])
+            
+            # Update motion profile
+            tilt_controller.motion = MotionProfile(CONFIG['servo']['motion'])
+        
+        logging.info(f"Applied movement preset: {preset_name} ({preset['description']})")
+        if CONFIG['debug'].get('pid_debug', False):
+            logging.debug(
+                f"Preset change: {prev_preset} → {preset_name}\n"
+                f"Pan gain: {CONFIG['servo']['pan_gain']}, "
+                f"Tilt gain: {CONFIG['servo']['tilt_gain']}\n"
+                f"Max speed: {CONFIG['servo']['velocity']['max_speed']}, "
+                f"Acceleration: {CONFIG['servo']['velocity']['acceleration']}, "
+                f"Enabled: {CONFIG['servo']['velocity']['enabled']}"
+            )
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to apply movement preset {preset_name}: {str(e)}")
+        return False
 
 # PID Controller Constants
 PID_MAXIMUM_INTEGRAL = 2000
@@ -184,10 +503,57 @@ TILT_GAIN = CONFIG['servo']['tilt_gain']
 UPDATE_INTERVAL = CONFIG['servo']['update_interval']
 
 class MotionProfile:
-    """Generates smooth motion profiles for servo movements"""
+    """
+    Motion Profile Generator for Smooth Servo Movements
+    
+    Generates smooth motion profiles for servo movements using S-curve acceleration
+    profiles. This ensures smooth transitions between positions while respecting
+    velocity and acceleration limits.
+
+    Features:
+    ---------
+    - S-curve acceleration profiles
+    - Configurable smoothing factors
+    - Velocity and acceleration limits
+    - Real-time position updates
+    - Movement state tracking
+    - Debug logging capabilities
+
+    Configuration:
+    -------------
+    The profile behavior is configured through the CONFIG dictionary:
+    - Movement duration
+    - Maximum acceleration
+    - Velocity limits
+    - Smoothing factors
+    - Debug options
+
+    The profile ensures:
+    - Smooth starts and stops
+    - Controlled acceleration
+    - Minimal mechanical stress
+    - Natural-feeling motion
+    """
     
     def __init__(self, config=None):
-        """Initialize motion profile generator"""
+        """
+        Initialize motion profile generator with configuration.
+        
+        Args:
+            config (dict, optional): Configuration dictionary overriding defaults
+                                   from CONFIG['servo']['motion']
+        
+        The initialization:
+        1. Validates and processes configuration
+        2. Sets up movement parameters
+        3. Initializes state tracking
+        4. Configures debug logging
+        
+        Raises:
+            ValueError: If configuration is missing required fields
+            TypeError: If configuration is not a dictionary
+            RuntimeError: If initialization fails
+        """
         try:
             # Ensure config is a dictionary
             if config is None:
@@ -205,13 +571,13 @@ class MotionProfile:
             # Get acceleration configuration
             accel_config = self.config.get('acceleration', {})
             self.accel_enabled = bool(accel_config.get('enabled', True))
-            self.max_accel = float(accel_config.get('max_accel', 5000))
-            self.smoothing = float(accel_config.get('smoothing', 0.7))
+            self.max_accel = float(accel_config.get('max_accel', 1000))
+            self.smoothing = float(accel_config.get('smoothing', 0.85))
             
             # Get velocity configuration
             vel_config = self.config.get('velocity', {})
-            self.max_vel = float(vel_config.get('max', 2000))
-            self.min_vel = float(vel_config.get('min', 100))
+            self.max_vel = float(vel_config.get('max', 500))
+            self.min_vel = float(vel_config.get('min', 50))
             
             # Movement state
             self.is_moving = False
@@ -233,8 +599,57 @@ class MotionProfile:
             logging.error(f"Failed to initialize MotionProfile: {str(e)}, Config: {config}")
             raise RuntimeError(f"Motion Profile initialization failed: {str(e)}") from e
     
+    def _s_curve_progress(self, t):
+        """
+        Calculate S-curve progress with configurable smoothing.
+        
+        Implements a sigmoid-based S-curve for smooth acceleration and deceleration.
+        The curve is scaled and adjusted based on smoothing factors to ensure
+        exact start and end positions.
+        
+        Args:
+            t (float): Time progress from 0 to 1
+            
+        Returns:
+            float: Position progress from 0 to 1
+            
+        The S-curve:
+        1. Applies smoothing factor
+        2. Uses sigmoid function for smooth transitions
+        3. Scales output to exact range
+        4. Handles boundary conditions
+        """
+        if t <= 0:
+            return 0
+        if t >= 1:
+            return 1
+            
+        # Apply smoothing factor to create S-curve
+        t = t * (1 + (1 - self.smoothing) * 2) - (1 - self.smoothing)
+        progress = 1 / (1 + np.exp(-t * 12 + 6))  # Sigmoid function
+        
+        # Scale progress to ensure it reaches exactly 0 at t=0 and 1 at t=1
+        progress = (progress - 1/(1 + np.exp(6))) / (1/(1 + np.exp(-6)) - 1/(1 + np.exp(6)))
+        
+        return float(progress)
+    
     def start_move(self, from_pos, to_pos):
-        """Start a new movement from current position to target"""
+        """
+        Start a new movement from current position to target.
+        
+        Args:
+            from_pos (float): Starting position
+            to_pos (float): Target position
+            
+        Returns:
+            float: Initial position for the movement
+            
+        The method:
+        1. Validates and stores movement parameters
+        2. Initializes timing and state tracking
+        3. Calculates movement distance
+        4. Begins motion profile generation
+        """
         if not self.enabled:
             return to_pos
             
@@ -251,24 +666,26 @@ class MotionProfile:
         
         return self.current_pos
     
-    def _s_curve_progress(self, t):
-        """Calculate S-curve progress with configurable smoothing"""
-        if t <= 0:
-            return 0
-        if t >= 1:
-            return 1
-            
-        # Apply smoothing factor to create S-curve
-        t = t * (1 + (1 - self.smoothing) * 2) - (1 - self.smoothing)
-        progress = 1 / (1 + np.exp(-t * 12 + 6))  # Sigmoid function
-        
-        # Scale progress to ensure it reaches exactly 0 at t=0 and 1 at t=1
-        progress = (progress - 1/(1 + np.exp(6))) / (1/(1 + np.exp(-6)) - 1/(1 + np.exp(6)))
-        
-        return float(progress)
-    
     def update(self):
-        """Update motion profile and return next position"""
+        """
+        Update motion profile and return next position.
+        
+        Calculates the next position in the motion profile based on elapsed time
+        and profile parameters. Handles acceleration, velocity, and position
+        calculations.
+        
+        Returns:
+            float or None: Next position in the profile, or None if movement complete
+            
+        The update process:
+        1. Check if profile is active
+        2. Calculate elapsed time
+        3. Generate base progress
+        4. Apply S-curve if acceleration enabled
+        5. Calculate new position
+        6. Update movement state
+        7. Handle movement completion
+        """
         if not self.enabled or not self.is_moving:
             return None
         
@@ -307,14 +724,54 @@ class MotionProfile:
         return self.current_pos
     
     def is_profile_active(self):
-        """Check if profile is currently generating positions"""
+        """
+        Check if profile is currently generating positions.
+        
+        Returns:
+            bool: True if profile is active and generating positions
+        """
         return self.enabled and self.is_moving
     
     def get_target(self):
-        """Get the final target position"""
+        """
+        Get the final target position.
+        
+        Returns:
+            float or None: Target position if profile is enabled, None otherwise
+        """
         return self.target_pos if self.enabled else None
 
 class PID_Controller:
+    """
+    Advanced PID Controller with Motion Profile Integration
+    
+    This controller provides precise positioning through PID control while incorporating
+    motion profiling for smooth movements. It features anti-windup protection,
+    deadband handling, and configurable gains.
+
+    Features:
+    ---------
+    - Time-based derivative calculation
+    - Integral anti-windup protection
+    - Configurable deadband for error and output
+    - Motion profile integration for smooth transitions
+    - Decay factor for integral term
+    - Automatic gain scaling
+
+    Configuration:
+    -------------
+    The controller behavior can be tuned through the CONFIG dictionary:
+    - PID gains (proportion, integral, derivative)
+    - Integral limits and decay
+    - Deadband thresholds
+    - Motion profile parameters
+
+    Args:
+        proportion_gain (float): The proportional gain (scaled by 1024)
+        integral_gain (float): The integral gain (scaled by 16384)
+        derivative_gain (float): The derivative gain (scaled by 1024)
+        servo (bool): Whether this controller is for a servo (affects center position)
+    """
     def __init__(self, proportion_gain, integral_gain, derivative_gain, servo):
         # Convert gains to float equivalents of the bit-shifted values
         self.proportion_gain = float(proportion_gain) / 1024.0  # Equivalent of >> 10
@@ -353,6 +810,15 @@ class PID_Controller:
         self.reset()
 
     def reset(self):
+        """
+        Reset the controller state.
+        
+        Resets all internal state variables to their initial values:
+        - Previous error and time
+        - Integral accumulator
+        - Command and target values
+        - PID output history
+        """
         self.previous_error = None
         self.previous_time = None
         self.integral_value = 0.0
@@ -362,7 +828,18 @@ class PID_Controller:
         self.target_position = self.command
 
     def set_target(self, new_target):
-        """Set a new target position with motion profile"""
+        """
+        Set a new target position with motion profile integration.
+        
+        Args:
+            new_target (float): The desired target position
+            
+        The method:
+        1. Calculates the required movement size
+        2. Determines if motion profiling should be used
+        3. Either starts a new motion profile or updates target directly
+        4. Updates internal target state
+        """
         # Calculate step size
         step_size = abs(new_target - self.target_position)
         
@@ -380,12 +857,48 @@ class PID_Controller:
         self.target_position = new_target
 
     def apply_deadband(self, value, deadband):
-        """Apply deadband to a value"""
+        """
+        Apply deadband to a value to prevent small oscillations.
+        
+        Args:
+            value (float): The input value to apply deadband to
+            deadband (float): The deadband threshold
+            
+        Returns:
+            float: The value after deadband application (0 if within deadband)
+        """
         if abs(value) <= deadband:
             return 0.0
         return value
 
     def update(self, error):
+        """
+        Update the controller state and calculate new output.
+        
+        This is the main control loop that:
+        1. Handles motion profile integration
+        2. Calculates PID terms
+        3. Applies anti-windup protection
+        4. Manages deadband
+        5. Produces final output command
+        
+        Args:
+            error (float): Current position error
+            
+        Returns:
+            int: The calculated command value for the servo
+            
+        The update process:
+        1. Check and update motion profile if active
+        2. Apply deadband to error if enabled
+        3. Calculate each PID term:
+           - Proportional: direct error scaling
+           - Integral: time-based integration with decay
+           - Derivative: based on movement state velocity
+        4. Apply anti-windup protection
+        5. Combine terms and apply limits
+        6. Convert to integer command
+        """
         current_time = time.time()
         
         # Check if we're following a motion profile
@@ -414,11 +927,21 @@ class PID_Controller:
             if self.deadband_enabled:
                 working_error = self.apply_deadband(error, self.error_deadband)
             
+            # Get velocity from movement state instead of calculating it
+            if self.servo:
+                axis = 'pan' if self.proportion_gain == CONFIG['servo']['pan_gain'] else 'tilt'
+                current_velocity = movement_state[axis]['velocity']
+            else:
+                current_velocity = 0.0
+            
             # Calculate PID terms with float math
             p_term = working_error * self.proportion_gain
             
             # Enhanced integral term with time-based integration and decay
             if self.integral_enabled and self.integral_gain != 0:  # Extra safety check
+                # Store previous integral for debug
+                prev_integral = self.integral_value
+                
                 # Apply decay to existing integral
                 self.integral_value *= self.integral_decay
                 
@@ -433,31 +956,41 @@ class PID_Controller:
                         if abs(command_delta) < abs(self.last_pid):
                             windup_scale = 0.9  # Reduce integral by 10% when limited
                             self.integral_value *= windup_scale
+                            if self.debug:
+                                logging.debug(f"Anti-windup active - scale: {windup_scale}, "
+                                            f"command_delta: {command_delta:.2f}, last_pid: {self.last_pid:.2f}")
                 
                 # Apply limits
                 self.integral_value = min(max(self.integral_value, self.integral_min), self.integral_max)
                 
                 i_term = self.integral_value * self.integral_gain
+                
+                if self.debug:
+                    integral_change = self.integral_value - prev_integral
+                    logging.debug(f"Integral update - "
+                                f"prev: {prev_integral:.2f}, new: {self.integral_value:.2f}, "
+                                f"change: {integral_change:+.2f}, decay: {self.integral_decay:.3f}, "
+                                f"error: {integral_error:.2f}")
             else:
                 i_term = 0.0
             
-            # Time-based derivative (using main error deadband)
-            if self.previous_error is not None:
-                prev_working_error = self.previous_error
-                if self.deadband_enabled:
-                    prev_working_error = self.apply_deadband(self.previous_error, self.error_deadband)
-                d_term = ((working_error - prev_working_error) / dt) * self.derivative_gain
-            else:
-                d_term = 0.0
+            # Improved derivative term using movement state velocity
+            # Note: current_velocity is already in the correct direction
+            d_term = -current_velocity * (self.derivative_gain * 0.5)  # Reduced gain
             
-            # Combine terms
+            # Combine terms (no feedforward)
             pid = p_term + i_term + d_term
             self.last_pid = pid  # Store for anti-windup
             
             if self.debug:
-                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, "
-                            f"Total: {pid:.4f}, dt: {dt:.4f}, Integral: {self.integral_value:.4f}, "
-                            f"Error: {error:.1f}, Working Error: {working_error:.1f}")
+                logging.debug(
+                    f"PID calculation - "
+                    f"Target: {self.target_position:.1f}, Current: {self.command:.1f}, "
+                    f"Raw Error: {error:.2f}, Working Error: {working_error:.2f}, "
+                    f"Movement Velocity: {current_velocity:.2f}, "
+                    f"P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, "
+                    f"Total: {pid:.4f}, dt: {dt:.4f}"
+                )
             
             if self.servo:
                 self.previous_command = self.command
@@ -466,11 +999,18 @@ class PID_Controller:
                 
                 # Apply output deadband if enabled
                 if self.deadband_enabled:
-                    if abs(new_command - self.command) <= self.output_deadband:
+                    command_delta = new_command - self.command
+                    if abs(command_delta) <= self.output_deadband:
+                        if self.debug:
+                            logging.debug(f"Output deadband active - delta: {command_delta:.2f} ≤ {self.output_deadband:.2f}")
                         new_command = self.command
                 
                 # Apply limits and convert to integer
+                prev_command = self.command
                 self.command = min(max(new_command, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
+                
+                if self.debug and self.command != new_command:
+                    logging.debug(f"Command limited - raw: {new_command:.1f}, limited: {self.command:.1f}")
         
         self.previous_error = float(error)
         self.previous_time = current_time
@@ -627,24 +1167,428 @@ def get_video_path():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(ensure_output_dir(), f"pixy2_recording_{timestamp}.avi")
 
-def handle_key_event(key, pan_controller, tilt_controller):
-    """Modified to use controller objects directly"""
+def calculate_velocity(current_velocity, target_velocity, dt):
+    """
+    Calculate new velocity based on acceleration limits and smoothing.
+    
+    Implements sophisticated velocity control with:
+    - Acceleration limiting
+    - Smoothing for natural motion
+    - Minimum speed thresholds
+    - Scaled acceleration curves
+    
+    Args:
+        current_velocity (float): Current velocity
+        target_velocity (float): Desired target velocity
+        dt (float): Time delta since last update
+        
+    Returns:
+        float: New calculated velocity respecting limits and smoothing
+        
+    The calculation:
+    1. Applies acceleration limits
+    2. Uses smoothing for natural feel
+    3. Handles minimum speed threshold
+    4. Provides smooth deceleration
+    """
+    velocity_config = CONFIG['servo']['velocity']
+    max_accel = velocity_config['acceleration']
+    min_speed = velocity_config['min_speed']
+    smoothing_config = velocity_config.get('smoothing', {})
+    
+    # Calculate maximum velocity change for this time step
+    max_delta = max_accel * dt
+    
+    # Calculate desired velocity change
+    desired_delta = target_velocity - current_velocity
+    
+    # Apply smooth acceleration curve
+    if abs(desired_delta) > 0:
+        # Scale acceleration based on how close we are to target velocity
+        accel_scale = min(1.0, abs(desired_delta) / abs(target_velocity) if target_velocity != 0 else 0)
+        
+        # Apply enhanced smoothing if enabled
+        if smoothing_config.get('enabled', True):
+            smoothing_factor = float(smoothing_config.get('factor', 0.8))
+            # Apply sigmoid-like smoothing to acceleration
+            accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
+        
+        # Apply smoothing to acceleration
+        smoothed_accel = max_delta * (0.2 + 0.8 * accel_scale)  # Never less than 20% acceleration
+        # Limit velocity change by smoothed acceleration
+        actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
+    else:
+        actual_delta = 0
+    
+    # Calculate new velocity
+    new_velocity = current_velocity + actual_delta
+    
+    # Apply minimum speed threshold to avoid tiny movements
+    if abs(new_velocity) < min_speed:
+        if abs(target_velocity) > 0:
+            # If we have a target, maintain minimum speed
+            new_velocity = min_speed * (1 if target_velocity > 0 else -1)
+        else:
+            # If no target, come to a stop with smooth deceleration
+            decel_factor = 0.8  # Smooth deceleration
+            new_velocity = current_velocity * decel_factor
+            # Stop completely if very slow
+            if abs(new_velocity) < min_speed * 0.5:
+                new_velocity = 0.0
+    
+    if CONFIG['debug'].get('pid_debug', False):
+        logging.debug(
+            f"Velocity calculation - "
+            f"current: {current_velocity:.2f}, "
+            f"target: {target_velocity:.2f}, "
+            f"dt: {dt:.4f}, "
+            f"max_delta: {max_delta:.2f}, "
+            f"actual_delta: {actual_delta:.2f}, "
+            f"new: {new_velocity:.2f}"
+        )
+    
+    return new_velocity
+
+def update_movement_state(axis_state, target_velocity, dt):
+    """
+    Update movement state for an axis (pan or tilt).
+    
+    Manages the complete state of an axis including:
+    - Velocity calculations
+    - Position tracking
+    - Timing management
+    - Debug logging
+    
+    Args:
+        axis_state (dict): Current state of the axis
+        target_velocity (float): Desired velocity
+        dt (float): Time delta since last update
+        
+    Returns:
+        float: New position for the axis
+        
+    The update process:
+    1. Stores previous state
+    2. Updates velocity
+    3. Calculates position change
+    4. Updates timing
+    5. Logs debug information
+    """
+    # Store previous state for debugging
+    prev_velocity = axis_state['velocity']
+    prev_position = axis_state['last_position']
+    
+    # Update velocity
+    axis_state['velocity'] = calculate_velocity(
+        axis_state['velocity'],
+        target_velocity,
+        dt
+    )
+    
+    # Calculate position change
+    position_delta = axis_state['velocity'] * dt
+    new_position = axis_state['last_position'] + position_delta
+    
+    # Update state
+    axis_state['last_position'] = new_position
+    axis_state['last_update'] = time.time()
+    
+    if CONFIG['debug'].get('pid_debug', False):
+        velocity_change = axis_state['velocity'] - prev_velocity
+        position_change = new_position - prev_position
+        logging.debug(
+            f"Movement state update - "
+            f"Position: {prev_position:.1f} → {new_position:.1f} (Δ{position_change:+.1f}), "
+            f"Velocity: {prev_velocity:.1f} → {axis_state['velocity']:.1f} (Δ{velocity_change:+.1f}), "
+            f"dt: {dt:.4f}"
+        )
+    
+    return new_position
+
+def process_held_keys(pan_controller, tilt_controller):
+    """
+    Process currently held keys and update movement accordingly.
+    
+    Implements the main movement logic:
+    - Velocity-based movement
+    - Time-based updates
+    - Controller updates
+    - State management
+    
+    Args:
+        pan_controller (PID_Controller): Controller for pan axis
+        tilt_controller (PID_Controller): Controller for tilt axis
+        
+    Returns:
+        tuple: (target_pan, target_tilt) positions
+        
+    The process:
+    1. Calculates time delta
+    2. Determines target velocities
+    3. Updates movement state
+    4. Updates controller targets
+    5. Applies position limits
+    """
+    global key_states, movement_state
+    current_time = time.time()
+    
+    if not CONFIG['servo']['velocity']['enabled']:
+        # Use existing step-based movement if velocity mode is disabled
+        return process_held_keys_legacy(pan_controller, tilt_controller)
+    
+    # Calculate time delta
+    dt = current_time - movement_state['pan']['last_update']
+    if dt <= 0:  # Avoid division by zero
+        dt = CONFIG['servo']['update_interval']
+    
+    # Calculate target velocities
+    pan_velocity = 0.0
+    tilt_velocity = 0.0
+    max_speed = CONFIG['servo']['velocity']['max_speed']
+    
+    if key_states['a']['pressed']:
+        pan_velocity = -max_speed
+    elif key_states['d']['pressed']:
+        pan_velocity = max_speed
+        
+    if key_states['w']['pressed']:
+        tilt_velocity = -max_speed
+    elif key_states['s']['pressed']:
+        tilt_velocity = max_speed
+    
+    # Update movement state and calculate new positions
+    new_pan = update_movement_state(movement_state['pan'], pan_velocity, dt)
+    new_tilt = update_movement_state(movement_state['tilt'], tilt_velocity, dt)
+    
+    # Apply limits
+    new_pan = max(PIXY_RCS_MINIMUM_POSITION, min(PIXY_RCS_MAXIMUM_POSITION, new_pan))
+    new_tilt = max(PIXY_RCS_MINIMUM_POSITION, min(PIXY_RCS_MAXIMUM_POSITION, new_tilt))
+    
+    # Update controllers
+    pan_controller.set_target(new_pan)
+    tilt_controller.set_target(new_tilt)
+    
+    if CONFIG['debug'].get('pid_debug', False) and (pan_velocity != 0 or tilt_velocity != 0):
+        logging.debug(f"Velocity movement - pan: {pan_velocity:.2f}, tilt: {tilt_velocity:.2f}")
+    
+    return pan_controller.target_position, tilt_controller.target_position
+
+def process_held_keys_legacy(pan_controller, tilt_controller):
+    """Legacy step-based movement (kept as fallback)"""
+    global key_states
+    current_time = time.time()
+    
+    # Get step sizes from config
+    pan_step = CONFIG['servo']['pan_step']
+    tilt_step = CONFIG['servo']['tilt_step']
+    
+    # Calculate hold duration and scale step size
+    def get_scaled_step(key, base_step):
+        if not key_states[key]['pressed']:
+            return 0
+        hold_duration = current_time - key_states[key]['press_start']
+        # Start with smaller steps and ramp up
+        scale = min(1.0, hold_duration * 5.0)  # Reach full speed in 0.2 seconds
+        return base_step * scale
+    
+    # Calculate pan movement
+    pan_step_size = 0
+    if key_states['a']['pressed']:
+        pan_step_size = -get_scaled_step('a', pan_step)
+    elif key_states['d']['pressed']:
+        pan_step_size = get_scaled_step('d', pan_step)
+        
+    # Calculate tilt movement
+    tilt_step_size = 0
+    if key_states['w']['pressed']:
+        tilt_step_size = -get_scaled_step('w', tilt_step)
+    elif key_states['s']['pressed']:
+        tilt_step_size = get_scaled_step('s', tilt_step)
+    
+    # Apply movements if any keys are held
+    if pan_step_size != 0:
+        new_pan = max(PIXY_RCS_MINIMUM_POSITION, 
+                     min(PIXY_RCS_MAXIMUM_POSITION, 
+                         pan_controller.command + pan_step_size))
+        pan_controller.set_target(new_pan)
+        
+    if tilt_step_size != 0:
+        new_tilt = max(PIXY_RCS_MINIMUM_POSITION,
+                      min(PIXY_RCS_MAXIMUM_POSITION,
+                          tilt_controller.command + tilt_step_size))
+        tilt_controller.set_target(new_tilt)
+    
+    if CONFIG['debug'].get('pid_debug', False) and (pan_step_size != 0 or tilt_step_size != 0):
+        logging.debug(f"Legacy movement - pan_step: {pan_step_size:.2f}, tilt_step: {tilt_step_size:.2f}")
+    
+    return pan_controller.target_position, tilt_controller.target_position
+
+def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
+    """
+    Handle key press events and update movement state.
+    
+    Provides the interface between user input and movement system:
+    - Key state management
+    - Velocity targeting
+    - Movement initialization
+    - Debug logging
+    - Preset switching
+    
+    Args:
+        key (int): ASCII value of pressed key
+        pan_controller (PID_Controller): Controller for pan axis
+        tilt_controller (PID_Controller): Controller for tilt axis
+        terminal (TerminalHandler, optional): Terminal interface for messages
+        
+    Returns:
+        tuple: (target_pan, target_tilt) positions
+        
+    Key mappings:
+    - a/A: Pan left
+    - d/D: Pan right
+    - w/W: Tilt up
+    - s/S: Tilt down
+    - c/C: Center both axes
+    - 1: Smooth preset
+    - 2: Responsive preset
+    - 3: Precise preset
+    - 4: Balanced preset
+    """
+    global key_states, movement_state
+    current_time = time.time()
+    
+    if not CONFIG['servo']['velocity']['enabled']:
+        # Use legacy step-based movement if velocity mode is disabled
+        return handle_key_event_legacy(key, pan_controller, tilt_controller)
+    
+    # Handle preset switching
+    preset_keys = {
+        ord('1'): 'smooth',
+        ord('2'): 'responsive',
+        ord('3'): 'precise',
+        ord('4'): 'balanced'
+    }
+    
+    if key in preset_keys:
+        preset_name = preset_keys[key]
+        if apply_movement_preset(preset_name, pan_controller, tilt_controller):
+            if terminal:
+                terminal.show_message(f"Switched to {preset_name} preset")
+        return pan_controller.target_position, tilt_controller.target_position
+    
+    # Update key states and set target velocities
+    max_speed = CONFIG['servo']['velocity']['max_speed']
+    debug_enabled = CONFIG['debug'].get('pid_debug', False)
+    
+    def update_key_state(key_name, pressed, target_vel, opposing_key=None):
+        """Helper to update key state with debug logging"""
+        if pressed and not key_states[key_name]['pressed']:
+            # Key just pressed
+            key_states[key_name]['press_start'] = current_time
+            key_states[key_name]['target_velocity'] = target_vel
+            if debug_enabled:
+                logging.debug(f"Key '{key_name}' pressed - target velocity: {target_vel:.1f}")
+        
+        key_states[key_name]['pressed'] = pressed
+        
+        # Handle opposing key
+        if opposing_key and pressed:
+            if key_states[opposing_key]['pressed']:
+                if debug_enabled:
+                    logging.debug(f"Releasing opposing key '{opposing_key}'")
+            key_states[opposing_key]['pressed'] = False
+            key_states[opposing_key]['target_velocity'] = 0.0
+    
+    if key in [ord('a'), ord('A')]:
+        update_key_state('a', True, -max_speed, opposing_key='d')
+    elif key in [ord('d'), ord('D')]:
+        update_key_state('d', True, max_speed, opposing_key='a')
+    elif key in [ord('w'), ord('W')]:
+        update_key_state('w', True, -max_speed, opposing_key='s')
+    elif key in [ord('s'), ord('S')]:
+        update_key_state('s', True, max_speed, opposing_key='w')
+    elif key in [ord('c'), ord('C')]:  # center
+        if debug_enabled:
+            logging.debug("Center command received - resetting all states")
+        # Reset all key states
+        for k in key_states:
+            key_states[k]['pressed'] = False
+            key_states[k]['press_start'] = 0
+            key_states[k]['velocity'] = 0.0
+            key_states[k]['target_velocity'] = 0.0
+        
+        # Reset movement state
+        movement_state['pan']['velocity'] = 0.0
+        movement_state['pan']['last_position'] = PIXY_RCS_CENTER_POSITION
+        movement_state['pan']['last_update'] = current_time
+        
+        movement_state['tilt']['velocity'] = 0.0
+        movement_state['tilt']['last_position'] = PIXY_RCS_CENTER_POSITION
+        movement_state['tilt']['last_update'] = current_time
+        
+        # Reset PID controllers
+        pan_controller.reset()
+        tilt_controller.reset()
+        
+        # Set center targets
+        pan_controller.set_target(PIXY_RCS_CENTER_POSITION)
+        tilt_controller.set_target(PIXY_RCS_CENTER_POSITION)
+        
+        if debug_enabled:
+            logging.debug("All states reset, servos centering")
+    
+    if debug_enabled:
+        active_keys = [k for k in key_states if key_states[k]['pressed']]
+        if active_keys:
+            logging.debug(f"Active keys: {active_keys}, "
+                        f"Pan velocity targets: [a: {key_states['a']['target_velocity']:.1f}, "
+                        f"d: {key_states['d']['target_velocity']:.1f}], "
+                        f"Tilt velocity targets: [w: {key_states['w']['target_velocity']:.1f}, "
+                        f"s: {key_states['s']['target_velocity']:.1f}]")
+    
+    # Process movement immediately to avoid delay
+    return process_held_keys(pan_controller, tilt_controller)
+
+def handle_key_event_legacy(key, pan_controller, tilt_controller):
+    """Legacy step-based key handling"""
+    global key_states
     current_pan = pan_controller.command
     current_tilt = tilt_controller.command
     
-    if key in [ord('a'), ord('A')]:  # left
-        new_pan = max(PIXY_RCS_MINIMUM_POSITION, current_pan - PAN_STEP)
+    # Get step sizes from config
+    pan_step = CONFIG['servo']['pan_step']
+    tilt_step = CONFIG['servo']['tilt_step']
+    
+    # Update key states
+    current_time = time.time()
+    if key in [ord('a'), ord('A')]:
+        if not key_states['a']['pressed']:
+            key_states['a']['press_start'] = current_time
+        key_states['a']['pressed'] = True
+        new_pan = max(PIXY_RCS_MINIMUM_POSITION, current_pan - pan_step)
         pan_controller.set_target(new_pan)
-    elif key in [ord('d'), ord('D')]:  # right
-        new_pan = min(PIXY_RCS_MAXIMUM_POSITION, current_pan + PAN_STEP)
+    elif key in [ord('d'), ord('D')]:
+        if not key_states['d']['pressed']:
+            key_states['d']['press_start'] = current_time
+        key_states['d']['pressed'] = True
+        new_pan = min(PIXY_RCS_MAXIMUM_POSITION, current_pan + pan_step)
         pan_controller.set_target(new_pan)
-    elif key in [ord('s'), ord('S')]:  # up
-        new_tilt = min(PIXY_RCS_MAXIMUM_POSITION, current_tilt + TILT_STEP)
+    elif key in [ord('s'), ord('S')]:
+        if not key_states['s']['pressed']:
+            key_states['s']['press_start'] = current_time
+        key_states['s']['pressed'] = True
+        new_tilt = min(PIXY_RCS_MAXIMUM_POSITION, current_tilt + tilt_step)
         tilt_controller.set_target(new_tilt)
-    elif key in [ord('w'), ord('W')]:  # down
-        new_tilt = max(PIXY_RCS_MINIMUM_POSITION, current_tilt - TILT_STEP)
+    elif key in [ord('w'), ord('W')]:
+        if not key_states['w']['pressed']:
+            key_states['w']['press_start'] = current_time
+        key_states['w']['pressed'] = True
+        new_tilt = max(PIXY_RCS_MINIMUM_POSITION, current_tilt - tilt_step)
         tilt_controller.set_target(new_tilt)
-    elif key in [ord('c'), ord('C')]:  # center
+    elif key in [ord('c'), ord('C')]:
+        for k in key_states:
+            key_states[k]['pressed'] = False
+            key_states[k]['press_start'] = 0
         pan_controller.set_target(PIXY_RCS_CENTER_POSITION)
         tilt_controller.set_target(PIXY_RCS_CENTER_POSITION)
     
@@ -702,7 +1646,6 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*CONFIG['video']['codec'])
         video_path = get_video_path()
         out = cv2.VideoWriter(video_path, fourcc, CONFIG['video']['fps'], (FRAME_WIDTH, FRAME_HEIGHT))
-        print(f"Recording video to: {video_path}")
 
         # Allocate raw frame buffer
         try:
@@ -721,6 +1664,12 @@ def main():
         target_pan = PIXY_RCS_CENTER_POSITION
         target_tilt = PIXY_RCS_CENTER_POSITION
 
+        # Initialize movement state
+        movement_state['pan']['last_position'] = current_pan
+        movement_state['pan']['last_update'] = time.time()
+        movement_state['tilt']['last_position'] = current_tilt
+        movement_state['tilt']['last_update'] = time.time()
+
         # Set initial positions
         print("Setting initial servo positions...")
         try:
@@ -731,12 +1680,19 @@ def main():
             sys.exit(1)
 
         print("\nControls:")
-        print("a/d : Pan left/right")
-        print("w/s : Tilt up/down")
-        print("c   : Center servos")
-        print("r   : Toggle recording")
-        print("p   : Toggle preview")
-        print("q   : Quit")
+        print("Movement:")
+        print("  a/d : Pan left/right")
+        print("  w/s : Tilt up/down")
+        print("  c   : Center servos")
+        print("\nPresets:")
+        print("  1   : Smooth (slower, precise)")
+        print("  2   : Responsive (quick)")
+        print("  3   : Precise (balanced speed)")
+        print("  4   : Balanced (default)")
+        print("\nVideo:")
+        print("  r   : Toggle recording")
+        print("  p   : Toggle preview")
+        print("  q   : Quit")
 
         # Initialize terminal for non-blocking input
         fd, old_settings = init_terminal()
@@ -774,7 +1730,7 @@ def main():
                         cv2.destroyAllWindows()
                 else:
                     # Handle pan/tilt commands
-                    target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller)
+                    target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller, terminal)
 
             # Get raw frame and process it
             ret = -1
@@ -808,12 +1764,25 @@ def main():
                             cv2.destroyAllWindows()
                         else:
                             # Handle pan/tilt commands
-                            target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller)
+                            target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller, terminal)
                 frames_processed += 1
+
+            # Check for key releases
+            if not is_data():  # No keys being pressed
+                for k in key_states:
+                    if key_states[k]['pressed']:
+                        key_states[k]['pressed'] = False
+                        key_states[k]['press_start'] = 0
+                        if CONFIG['debug'].get('pid_debug', False):
+                            logging.debug(f"Key {k} released")
 
             # Update movement at fixed interval
             current_time = time.time()
             if current_time - last_update >= UPDATE_INTERVAL:
+                # Process any held keys first
+                if any(k['pressed'] for k in key_states.values()):
+                    target_pan, target_tilt = process_held_keys(pan_controller, tilt_controller)
+                
                 # Calculate errors
                 pan_error = target_pan - current_pan
                 tilt_error = target_tilt - current_tilt

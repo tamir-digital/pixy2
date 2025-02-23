@@ -6,14 +6,168 @@
         "show_preview": true
     },
     "servo": {
-        "pan_step": 100,
-        "tilt_step": 100,
+        "pan_step": 25,
+        "tilt_step": 25,
         "update_interval": 0.016,
-        "pan_gain": 400,
-        "tilt_gain": 500
+        "pan_gain": 200,
+        "tilt_gain": 240,
+        "velocity": {
+            "enabled": true,
+            "max_speed": 50,
+            "acceleration": 200,
+            "ramp_time": 0.3,
+            "min_speed": 2,
+            "smoothing": {
+                "enabled": true,
+                "factor": 0.8,
+                "window": 3
+            }
+        },
+        "integral": {
+            "enabled": false,
+            "decay_factor": 0.98,
+            "max_limit": 1000,
+            "min_limit": -1000,
+            "anti_windup": true
+        },
+        "deadband": {
+            "enabled": true,
+            "error": 2.0,
+            "output": 1.5,
+            "integral_error": 1.0
+        },
+        "motion": {
+            "enabled": true,
+            "move_duration": 0.1,
+            "debug": false,
+            "acceleration": {
+                "enabled": true,
+                "max_accel": 1000,
+                "smoothing": 0.85
+            },
+            "velocity": {
+                "max": 500,
+                "min": 50
+            }
+        }
+    },
+    "movement_presets": {
+        "current": "balanced",
+        "presets": {
+            "smooth": {
+                "description": "Smooth, slower movements with high precision",
+                "servo": {
+                    "pan_gain": 180,
+                    "tilt_gain": 220,
+                    "velocity": {
+                        "max_speed": 30,
+                        "acceleration": 150,
+                        "ramp_time": 0.4,
+                        "min_speed": 1,
+                        "smoothing": {
+                            "factor": 0.9
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.15,
+                        "acceleration": {
+                            "max_accel": 800,
+                            "smoothing": 0.9
+                        }
+                    },
+                    "deadband": {
+                        "error": 1.5,
+                        "output": 1.0
+                    }
+                }
+            },
+            "responsive": {
+                "description": "Quick movements with less smoothing",
+                "servo": {
+                    "pan_gain": 220,
+                    "tilt_gain": 260,
+                    "velocity": {
+                        "max_speed": 70,
+                        "acceleration": 300,
+                        "ramp_time": 0.2,
+                        "min_speed": 3,
+                        "smoothing": {
+                            "factor": 0.7
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.08,
+                        "acceleration": {
+                            "max_accel": 1200,
+                            "smoothing": 0.7
+                        }
+                    },
+                    "deadband": {
+                        "error": 2.5,
+                        "output": 2.0
+                    }
+                }
+            },
+            "precise": {
+                "description": "High precision with balanced speed",
+                "servo": {
+                    "pan_gain": 200,
+                    "tilt_gain": 240,
+                    "velocity": {
+                        "max_speed": 40,
+                        "acceleration": 200,
+                        "ramp_time": 0.3,
+                        "min_speed": 1.5,
+                        "smoothing": {
+                            "factor": 0.85
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.12,
+                        "acceleration": {
+                            "max_accel": 1000,
+                            "smoothing": 0.85
+                        }
+                    },
+                    "deadband": {
+                        "error": 1.8,
+                        "output": 1.2
+                    }
+                }
+            },
+            "balanced": {
+                "description": "Default balanced behavior",
+                "servo": {
+                    "pan_gain": 200,
+                    "tilt_gain": 240,
+                    "velocity": {
+                        "max_speed": 50,
+                        "acceleration": 200,
+                        "ramp_time": 0.3,
+                        "min_speed": 2,
+                        "smoothing": {
+                            "factor": 0.8
+                        }
+                    },
+                    "motion": {
+                        "move_duration": 0.1,
+                        "acceleration": {
+                            "max_accel": 1000,
+                            "smoothing": 0.85
+                        }
+                    },
+                    "deadband": {
+                        "error": 2.0,
+                        "output": 1.5
+                    }
+                }
+            }
+        }
     },
     "debug": {
         "log_level": "INFO",
-        "show_fps": true
+        "show_fps": true,
+        "suppress_pixy_debug": true,
+        "pid_debug": true
     }
 }
