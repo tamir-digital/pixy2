@@ -20,6 +20,7 @@ import io
 import fcntl
 import platform
 import atexit
+import threading
 
 """
 Movement System Architecture
@@ -937,8 +938,10 @@ class PID_Controller:
                 is_continuous = any(k['pressed'] for k in key_states.values())
                 if is_continuous:
                     # During continuous movement, use velocity-based control
-                    # Reduce derivative term influence to prevent fighting the velocity system
-                    d_term = -current_velocity * (self.derivative_gain * 0.25)  # Further reduced gain
+                    # Almost eliminate PID influence during velocity-based movement
+                    d_term = -current_velocity * (self.derivative_gain * 0.1)  # Reduced from 0.25
+                    # Scale down proportional term during velocity movement
+                    working_error *= 0.2  # Reduce error influence
                 else:
                     # Normal derivative term for transitional movements
                     d_term = -current_velocity * (self.derivative_gain * 0.5)
@@ -1369,6 +1372,26 @@ def calculate_velocity(current_velocity, target_velocity, dt):
     is_accelerating = abs(current_velocity) < abs(scaled_target) * 0.95  # Increased from 0.8
     is_sustained = abs(current_velocity) >= abs(scaled_target) * 0.95
     
+    # Special handling for movement initiation with smoother start
+    if current_velocity == 0 and scaled_target != 0:
+        # Reduced initial velocity to 40% of target
+        initial_scale = 0.4
+        new_velocity = scaled_target * initial_scale
+        
+        # Apply cubic easing for smoother acceleration
+        accel_factor = min(1.0, dt / 0.1)  # Normalize time over 100ms
+        eased_velocity = new_velocity * (accel_factor * accel_factor * (3 - 2 * accel_factor))
+        new_velocity = eased_velocity
+        
+        if CONFIG['debug'].get('pid_debug', False):
+            logging.debug(
+                f"Instant velocity start:\n"
+                f"  Target: {scaled_target:.2f}\n"
+                f"  Initial velocity: {new_velocity:.2f}\n"
+                f"  Easing factor: {accel_factor:.3f}"
+            )
+        return new_velocity
+    
     # Special handling for sustained movement to prevent slowdown
     if is_sustained:
         # During sustained movement, actively maintain target velocity
@@ -1376,9 +1399,10 @@ def calculate_velocity(current_velocity, target_velocity, dt):
         current_ratio = abs(current_velocity) / abs(scaled_target)
         
         if current_ratio < maintain_factor:
-            # If velocity has dropped below maintain factor, boost it back up
+            # If velocity has dropped below maintain factor, boost it back up more aggressively
             direction = 1 if scaled_target > 0 else -1
-            new_velocity = direction * abs(scaled_target)  # Snap directly to target
+            boost_factor = 1.1  # Slight overcompensation
+            new_velocity = direction * abs(scaled_target) * boost_factor
             
             if CONFIG['debug'].get('pid_debug', False):
                 logging.debug(
@@ -1388,9 +1412,9 @@ def calculate_velocity(current_velocity, target_velocity, dt):
                 )
             return new_velocity
         
-        # For sustained movement, use minimal smoothing and high acceleration
-        smoothing_factor = 0.1  # Reduced from 0.2
-        accel_scale = 1.0  # Increased from 0.9
+        # For sustained movement, use minimal smoothing
+        smoothing_factor = 0.05  # Reduced from 0.1
+        accel_scale = 1.2  # Increased from 1.0
     elif is_accelerating:
         # Initial acceleration phase
         smoothing_factor = velocity_config['phases']['accelerating']['smoothing']
@@ -1619,6 +1643,137 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None, is_new
     global key_states, movement_state, VELOCITY_SCALE
     current_time = time.time()
     
+    # Add diagnostic test mode
+    if key in [ord('t'), ord('T')]:
+        if terminal:
+            terminal.show_message("Starting movement diagnostic test - press and hold 'a' key for 3 seconds...")
+            terminal.update_status("[TEST] Waiting for 'a' key press...")
+        
+        # Enable detailed logging for the test
+        CONFIG['debug']['pid_debug'] = True
+        movement_state['pan']['test_mode'] = {
+            'active': True,
+            'start_time': None,
+            'samples': [],
+            'phase_changes': [],
+            'velocity_changes': [],
+            'last_velocity': 0.0,
+            'max_velocity': 0.0,
+            'min_velocity': 0.0,
+            'hiccups': []
+        }
+        
+        def log_test_data(event_type, data):
+            if movement_state['pan']['test_mode']['active']:
+                current_time = time.time()
+                if movement_state['pan']['test_mode']['start_time'] is None:
+                    movement_state['pan']['test_mode']['start_time'] = current_time
+                
+                elapsed = current_time - movement_state['pan']['test_mode']['start_time']
+                data['elapsed'] = elapsed
+                data['event_type'] = event_type
+                movement_state['pan']['test_mode']['samples'].append(data)
+                
+                # Update test statistics
+                if event_type == 'velocity_update':
+                    test_state = movement_state['pan']['test_mode']
+                    new_velocity = data['new_velocity']
+                    test_state['max_velocity'] = max(test_state['max_velocity'], abs(new_velocity))
+                    test_state['min_velocity'] = min(test_state['min_velocity'], abs(new_velocity)) if abs(new_velocity) > 0 else test_state['min_velocity']
+                    
+                    # Check for hiccups (sudden velocity changes)
+                    velocity_delta = abs(new_velocity - test_state['last_velocity'])
+                    if velocity_delta > 5.0 and elapsed > 0.05:  # Ignore initial acceleration
+                        test_state['hiccups'].append({
+                            'time': elapsed,
+                            'delta': velocity_delta,
+                            'from': test_state['last_velocity'],
+                            'to': new_velocity
+                        })
+                    test_state['last_velocity'] = new_velocity
+                    
+                    # Update terminal status
+                    if terminal:
+                        status = f"[TEST] Time: {elapsed:.2f}s | "
+                        status += f"Velocity: {new_velocity:6.2f} | "
+                        status += f"Max: {test_state['max_velocity']:6.2f} | "
+                        status += f"Hiccups: {len(test_state['hiccups'])}"
+                        terminal.update_status(status)
+        
+        # Monkey-patch the calculate_velocity function to include test logging
+        original_calculate_velocity = calculate_velocity
+        def test_calculate_velocity(*args, **kwargs):
+            result = original_calculate_velocity(*args, **kwargs)
+            if movement_state['pan']['test_mode']['active']:
+                log_test_data('velocity_update', {
+                    'current_velocity': args[0],
+                    'target_velocity': args[1],
+                    'dt': args[2],
+                    'new_velocity': result
+                })
+            return result
+        
+        # Replace the function temporarily
+        globals()['calculate_velocity'] = test_calculate_velocity
+        
+        # Schedule cleanup after 3 seconds
+        def cleanup_test():
+            time.sleep(3)
+            CONFIG['debug']['pid_debug'] = False
+            globals()['calculate_velocity'] = original_calculate_velocity
+            
+            if movement_state['pan']['test_mode']['active']:
+                test_state = movement_state['pan']['test_mode']
+                
+                # Generate summary
+                summary_lines = [
+                    "\n=== Movement Test Results ===",
+                    f"Duration: {time.time() - test_state['start_time']:.2f} seconds",
+                    f"Maximum Velocity: {test_state['max_velocity']:.2f}",
+                    f"Minimum Velocity (non-zero): {test_state['min_velocity']:.2f}",
+                    f"\nHiccups Detected: {len(test_state['hiccups'])}"
+                ]
+                
+                if test_state['hiccups']:
+                    summary_lines.append("\nSignificant Velocity Changes:")
+                    for h in test_state['hiccups'][:3]:  # Show top 3 most significant
+                        summary_lines.append(
+                            f"  At {h['time']:.3f}s: {h['from']:.1f} → {h['to']:.1f} "
+                            f"(Δ{h['delta']:.1f})"
+                        )
+                    
+                    # Analysis
+                    avg_hiccup_time = sum(h['time'] for h in test_state['hiccups']) / len(test_state['hiccups'])
+                    summary_lines.extend([
+                        f"\nAnalysis:",
+                        f"- Average hiccup time: {avg_hiccup_time:.3f}s after start",
+                        f"- Most hiccups occur during {'acceleration' if avg_hiccup_time < 0.5 else 'sustained movement'}"
+                    ])
+                else:
+                    summary_lines.append("\nNo significant hiccups detected!")
+                
+                summary_lines.append("\n=== Test Complete ===")
+                
+                # Show summary in terminal
+                if terminal:
+                    terminal.clear_screen()
+                    print('\n'.join(summary_lines))
+                    time.sleep(2)  # Give time to read
+                    terminal.show_interface(log_file)
+                
+                # Reset test mode
+                movement_state['pan']['test_mode'] = {
+                    'active': False,
+                    'start_time': None,
+                    'samples': [],
+                    'phase_changes': [],
+                    'velocity_changes': []
+                }
+        
+        import threading
+        threading.Thread(target=cleanup_test, daemon=True).start()
+        return pan_controller.target_position, tilt_controller.target_position
+    
     # Handle preset switching
     preset_keys = {
         ord('1'): 'smooth',
@@ -1655,10 +1810,16 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None, is_new
         prev_state = key_states[key_name].copy()  # Store previous state for comparison
         
         if pressed:
-            if is_new_press:  # Only update press_start on initial press
-                key_states[key_name]['press_start'] = current_time
+            # Always treat as new press for immediate movement
+            key_states[key_name]['press_start'] = current_time
             key_states[key_name]['target_velocity'] = target_vel
             key_states[key_name]['pressed'] = True
+            
+            # Reset velocity to 0 to trigger instant velocity calculation
+            if is_new_press:
+                key_states[key_name]['velocity'] = 0.0
+                movement_state[get_axis_for_key(key_name)]['velocity'] = 0.0
+            
             if debug_enabled:
                 hold_duration = current_time - key_states[key_name]['press_start']
                 logging.debug(
@@ -1686,6 +1847,10 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None, is_new
                 f"  Previous: {prev_state}\n"
                 f"  Current: {key_states[key_name]}"
             )
+    
+    def get_axis_for_key(key_name):
+        """Helper to get the axis (pan/tilt) for a key"""
+        return 'pan' if key_name in ['a', 'd'] else 'tilt'
     
     if key in [ord('a'), ord('A')]:
         update_key_state('a', True, -max_speed, opposing_key='d', is_new_press=is_new_press)
