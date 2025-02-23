@@ -147,7 +147,7 @@ DEFAULT_CONFIG = {
         "motion": {
             "enabled": True,
             "move_duration": 0.1,  # 100ms for smooth steps
-            "debug": False,        # Separate debug flag for motion profiling
+            "debug": True,        # Enable motion profiling debug
             "acceleration": {
                 "enabled": True,   # Enable acceleration control
                 "max_accel": 1000, # Reduced from 5000 - Maximum acceleration
@@ -273,10 +273,10 @@ DEFAULT_CONFIG = {
         }
     },
     "debug": {
-        "log_level": "INFO",
+        "log_level": "DEBUG",  # Changed from INFO to DEBUG
         "show_fps": True,
         "suppress_pixy_debug": True,
-        "pid_debug": True        # Enable PID debugging
+        "pid_debug": True     # Enable PID debugging
     }
 }
 
@@ -1051,6 +1051,180 @@ def bayer_to_rgb(bayer_frame, width, height):
     rgb = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
     return rgb
 
+def validate_performance(stats):
+    """
+    Validate basic performance metrics.
+    Returns a dict with test results and recommendations.
+    """
+    results = {
+        'fps': {
+            'status': 'OK',
+            'value': 0,
+            'target': 30,
+            'message': ''
+        },
+        'timing': {
+            'status': 'OK',
+            'value': 0,
+            'target': 16,  # Target 16ms (60Hz)
+            'message': ''
+        },
+        'movement': {
+            'status': 'OK',
+            'value': 0,
+            'message': ''
+        }
+    }
+    
+    # FPS Check
+    if 'fps' in stats:
+        fps = stats['fps']
+        results['fps']['value'] = fps
+        if fps < 20:  # Below 20 FPS is problematic
+            results['fps']['status'] = 'WARNING'
+            results['fps']['message'] = f"Low FPS ({fps:.1f}). Target is 30+ FPS."
+    
+    # Timing Check
+    if 'timing' in stats:
+        avg_dt = stats['timing'].get('avg_dt', 0) * 1000  # Convert to ms
+        results['timing']['value'] = avg_dt
+        if avg_dt > 20:  # More than 20ms average delay
+            results['timing']['status'] = 'WARNING'
+            results['timing']['message'] = f"High average delay ({avg_dt:.1f}ms). Target is <16ms."
+    
+    # Movement Check
+    if 'movements' in stats:
+        pan_moves = stats['movements']['pan']['transitions']
+        tilt_moves = stats['movements']['tilt']['transitions']
+        total_moves = pan_moves + tilt_moves
+        results['movement']['value'] = total_moves
+        
+        if total_moves > 0:
+            # Calculate successful moves ratio
+            success_ratio = 1.0  # Assume all moves successful unless we find issues
+            
+            # Check for timing issues during movement
+            if 'timing' in stats and stats['timing'].get('max_dt', 0) > 0.1:  # >100ms spikes
+                success_ratio *= 0.8
+            
+            # Check for minimum speed triggers (indicates potential stutter)
+            min_speed_triggers = (stats['movements']['pan']['min_speed_triggers'] + 
+                                stats['movements']['tilt']['min_speed_triggers'])
+            if min_speed_triggers > total_moves * 0.2:  # More than 20% of moves triggered min speed
+                success_ratio *= 0.9
+            
+            if success_ratio < 0.9:
+                results['movement']['status'] = 'WARNING'
+                results['movement']['message'] = "Movement quality issues detected. Check for stuttering or delays."
+    
+    return results
+
+def generate_summary(stats):
+    """Generate a simple, readable summary of servo performance"""
+    results = validate_performance(stats)
+    
+    summary = [
+        "=== SERVO PERFORMANCE SUMMARY ===",
+        "",
+        "Performance Metrics:",
+        f"1. Frame Rate: {results['fps']['value']:.1f} FPS",
+        f"   Target: {results['fps']['target']} FPS",
+        f"   Status: {results['fps']['status']}",
+        f"   {results['fps']['message']}" if results['fps']['message'] else "",
+        "",
+        f"2. Response Time: {results['timing']['value']:.1f}ms average",
+        f"   Target: {results['timing']['target']}ms",
+        f"   Status: {results['timing']['status']}",
+        f"   {results['timing']['message']}" if results['timing']['message'] else "",
+        "",
+        f"3. Movement Quality",
+        f"   Total Movements: {results['movement']['value']}",
+        f"   Status: {results['movement']['status']}",
+        f"   {results['movement']['message']}" if results['movement']['message'] else "",
+        "",
+        "Configuration:",
+        f"  Pan Gain: {CONFIG['servo']['pan_gain']}",
+        f"  Tilt Gain: {CONFIG['servo']['tilt_gain']}",
+        f"  Max Speed: {CONFIG['servo']['velocity']['max_speed']}",
+        f"  Current Preset: {CONFIG['movement_presets']['current']}",
+        "",
+        "=== END SUMMARY ===\n"
+    ]
+    
+    return '\n'.join(line for line in summary if line is not None)
+
+def analyze_log_file(log_file_path):
+    """Analyze log file and generate diagnostic summary"""
+    try:
+        with open(log_file_path, 'r') as f:
+            lines = f.readlines()
+        
+        # Initialize statistics
+        stats = {
+            'fps': 0,
+            'timing': {
+                'max_dt': 0.0,
+                'min_dt': float('inf'),
+                'avg_dt': 0.0,
+                'samples': 0
+            },
+            'movements': {
+                'pan': {'transitions': 0, 'min_speed_triggers': 0},
+                'tilt': {'transitions': 0, 'min_speed_triggers': 0}
+            }
+        }
+        
+        # Process log lines
+        fps_values = []
+        for line in lines:
+            # Extract FPS
+            if "FPS:" in line:
+                try:
+                    fps = float(line.split("FPS:")[-1].split(',')[0])
+                    fps_values.append(fps)
+                except:
+                    pass
+            
+            # Extract timing
+            elif "dt:" in line:
+                try:
+                    dt = float(line.split("dt:")[-1].split()[0])
+                    stats['timing']['max_dt'] = max(stats['timing']['max_dt'], dt)
+                    stats['timing']['min_dt'] = min(stats['timing']['min_dt'], dt)
+                    stats['timing']['avg_dt'] += dt
+                    stats['timing']['samples'] += 1
+                except:
+                    pass
+            
+            # Extract movement data
+            elif "Movement state transition" in line:
+                if "pan" in line.lower():
+                    stats['movements']['pan']['transitions'] += 1
+                elif "tilt" in line.lower():
+                    stats['movements']['tilt']['transitions'] += 1
+            
+            # Extract minimum speed triggers
+            elif "min_speed_applied: True" in line:
+                if "pan" in line.lower():
+                    stats['movements']['pan']['min_speed_triggers'] += 1
+                elif "tilt" in line.lower():
+                    stats['movements']['tilt']['min_speed_triggers'] += 1
+        
+        # Calculate average FPS
+        if fps_values:
+            # Use the last 10 seconds of FPS values for current performance
+            recent_fps = fps_values[-300:] if len(fps_values) > 300 else fps_values
+            stats['fps'] = sum(recent_fps) / len(recent_fps)
+        
+        # Calculate average timing
+        if stats['timing']['samples'] > 0:
+            stats['timing']['avg_dt'] /= stats['timing']['samples']
+        
+        return generate_summary(stats)
+        
+    except Exception as e:
+        return f"Error analyzing log file: {str(e)}\n"
+
 def setup_logging():
     """Setup logging configuration"""
     # Create logs directory if it doesn't exist
@@ -1068,7 +1242,7 @@ def setup_logging():
         root.removeHandler(handler)
     
     # Create logger
-    root.setLevel(logging.DEBUG)  # Capture everything at root level
+    root.setLevel(logging.DEBUG)
     
     # File handler - gets everything
     file_handler = logging.FileHandler(log_file)
@@ -1078,16 +1252,13 @@ def setup_logging():
     
     # Console handler - only gets important messages
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)  # Only show warnings and errors
+    console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
     
     # Add filter to capture Pixy2 debug messages
     class Pixy2DebugFilter(logging.Filter):
         def filter(self, record):
-            # Filter out debug messages and Pixy2-related messages from console
-            if "Debug:" in record.msg or "Pixy2" in record.msg:
-                return False
-            return True
+            return "Debug:" not in record.msg and "Pixy2" not in record.msg
 
     # Add filter to console handler only
     console_handler.addFilter(Pixy2DebugFilter())
@@ -1154,8 +1325,26 @@ def setup_logging():
                     print(f'\033[s\033[F\r\033[K{message}\033[u', end='', flush=True)
                 else:
                     print('\r' + message, flush=True)
-
+    
+    # Write initial summary placeholder
+    with open(log_file, 'w') as f:
+        f.write("### LOG SUMMARY WILL BE INSERTED HERE ###\n\n")
+    
     return log_file, TerminalHandler()
+
+def finalize_logging(log_file):
+    """Insert summary at the start of the log file"""
+    if os.path.exists(log_file):
+        # Generate summary
+        summary = analyze_log_file(log_file)
+        
+        # Read existing log
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+        
+        # Write summary and log content
+        with open(log_file, 'w') as f:
+            f.write(summary + "\n" + log_content)
 
 def ensure_output_dir():
     """Ensure output directory exists"""
@@ -1188,7 +1377,26 @@ def calculate_velocity(current_velocity, target_velocity, dt):
     # Calculate desired velocity change
     desired_delta = scaled_target - current_velocity
     
+    # Add detailed key hold debug logging
+    if CONFIG['debug'].get('pid_debug', False):
+        hold_duration = 0
+        for key, state in key_states.items():
+            if state['pressed']:
+                hold_duration = time.time() - state['press_start']
+                logging.debug(
+                    f"Key '{key}' held for {hold_duration:.2f}s - "
+                    f"Current vel: {current_velocity:.2f}, "
+                    f"Target vel: {target_velocity:.2f}, "
+                    f"Scaled target: {scaled_target:.2f}, "
+                    f"Desired delta: {desired_delta:.2f}, "
+                    f"Max delta: {max_delta:.2f}"
+                )
+    
     # Apply smooth acceleration curve
+    accel_scale = 0.0  # Initialize for logging
+    smoothed_accel = 0.0  # Initialize for logging
+    actual_delta = 0.0  # Initialize for logging
+    
     if abs(desired_delta) > 0:
         # Scale acceleration based on how close we are to target velocity
         accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
@@ -1196,24 +1404,33 @@ def calculate_velocity(current_velocity, target_velocity, dt):
         # Apply enhanced smoothing if enabled
         if smoothing_config.get('enabled', True):
             smoothing_factor = float(smoothing_config.get('factor', 0.8))
-            # Apply sigmoid-like smoothing to acceleration
-            accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
+            # Only apply smoothing during initial acceleration, not during sustained movement
+            if abs(current_velocity) < abs(scaled_target):
+                # Apply sigmoid-like smoothing to acceleration
+                accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
+            else:
+                # During sustained movement, maintain target velocity
+                accel_scale = 1.0
         
         # Apply smoothing to acceleration
         smoothed_accel = max_delta * (0.2 + 0.8 * accel_scale)  # Never less than 20% acceleration
         # Limit velocity change by smoothed acceleration
         actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
-    else:
-        actual_delta = 0
     
     # Calculate new velocity
     new_velocity = current_velocity + actual_delta
     
+    # During sustained movement at target velocity, maintain it exactly
+    if abs(abs(current_velocity) - abs(scaled_target)) < 0.1:
+        new_velocity = scaled_target
+    
     # Apply minimum speed threshold to avoid tiny movements
+    min_speed_applied = False  # For logging
     if abs(new_velocity) < min_speed:
         if abs(scaled_target) > 0:
             # If we have a target, maintain minimum speed
             new_velocity = min_speed * (1 if scaled_target > 0 else -1)
+            min_speed_applied = True
         else:
             # If no target, come to a stop with smooth deceleration
             decel_factor = 0.8  # Smooth deceleration
@@ -1222,15 +1439,16 @@ def calculate_velocity(current_velocity, target_velocity, dt):
             if abs(new_velocity) < min_speed * 0.5:
                 new_velocity = 0.0
     
-    if CONFIG['debug'].get('pid_debug', False):
+    # Enhanced debug logging for key holds
+    if CONFIG['debug'].get('pid_debug', False) and any(state['pressed'] for state in key_states.values()):
         logging.debug(
-            f"Velocity calculation - "
-            f"current: {current_velocity:.2f}, "
-            f"target: {scaled_target:.2f}, "
-            f"dt: {dt:.4f}, "
-            f"max_delta: {max_delta:.2f}, "
-            f"actual_delta: {actual_delta:.2f}, "
-            f"new: {new_velocity:.2f}"
+            f"Velocity calculation results:\n"
+            f"  Acceleration:\n"
+            f"    scale: {accel_scale:.3f}\n"
+            f"    smoothed: {smoothed_accel:.2f}\n"
+            f"    actual delta: {actual_delta:.2f}\n"
+            f"  Final velocity: {new_velocity:.2f}\n"
+            f"  Min speed applied: {min_speed_applied}"
         )
     
     return new_velocity
@@ -1238,38 +1456,61 @@ def calculate_velocity(current_velocity, target_velocity, dt):
 def update_movement_state(axis_state, target_velocity, dt):
     """
     Update movement state for an axis (pan or tilt).
-    
-    Manages the complete state of an axis including:
-    - Velocity calculations
-    - Position tracking
-    - Timing management
-    - Debug logging
-    
-    Args:
-        axis_state (dict): Current state of the axis
-        target_velocity (float): Desired velocity
-        dt (float): Time delta since last update
-        
-    Returns:
-        float: New position for the axis
-        
-    The update process:
-    1. Stores previous state
-    2. Updates velocity
-    3. Calculates position change
-    4. Updates timing
-    5. Logs debug information
     """
     # Store previous state for debugging
     prev_velocity = axis_state['velocity']
     prev_position = axis_state['last_position']
+    prev_time = axis_state.get('last_update', time.time())
     
-    # Update velocity
-    axis_state['velocity'] = calculate_velocity(
-        axis_state['velocity'],
-        target_velocity,
-        dt
+    # Calculate actual time delta
+    current_time = time.time()
+    actual_dt = current_time - prev_time
+    
+    # Track state transitions
+    state_changed = (
+        (prev_velocity == 0 and target_velocity != 0) or  # Starting movement
+        (prev_velocity != 0 and target_velocity == 0) or  # Stopping movement
+        (prev_velocity * target_velocity < 0)             # Direction change
     )
+    
+    # Add detailed movement state logging
+    if CONFIG['debug'].get('pid_debug', False):
+        logging.debug(
+            f"Movement state update starting:\n"
+            f"  Previous state:\n"
+            f"    velocity: {prev_velocity:.2f}\n"
+            f"    position: {prev_position:.2f}\n"
+            f"    time: {prev_time:.3f}\n"
+            f"  Current parameters:\n"
+            f"    target velocity: {target_velocity:.2f}\n"
+            f"    dt (requested): {dt:.4f}\n"
+            f"    dt (actual): {actual_dt:.4f}\n"
+            f"  State transition: {state_changed}"
+        )
+    
+    # Immediately reset velocity if target is zero
+    if target_velocity == 0:
+        axis_state['velocity'] = 0.0
+        new_velocity = 0.0
+    else:
+        # Update velocity with detailed logging
+        new_velocity = calculate_velocity(
+            axis_state['velocity'],
+            target_velocity,
+            dt
+        )
+        axis_state['velocity'] = new_velocity
+    
+    velocity_change = new_velocity - prev_velocity
+    
+    if CONFIG['debug'].get('pid_debug', False) and abs(velocity_change) > 0.1:
+        logging.debug(
+            f"Significant velocity change detected:\n"
+            f"  Previous: {prev_velocity:.2f}\n"
+            f"  New: {new_velocity:.2f}\n"
+            f"  Change: {velocity_change:+.2f}\n"
+            f"  Target: {target_velocity:.2f}"
+        )
     
     # Calculate position change
     position_delta = axis_state['velocity'] * dt
@@ -1277,19 +1518,46 @@ def update_movement_state(axis_state, target_velocity, dt):
     
     # Update state
     axis_state['last_position'] = new_position
-    axis_state['last_update'] = time.time()
+    axis_state['last_update'] = current_time
     
     if CONFIG['debug'].get('pid_debug', False):
-        velocity_change = axis_state['velocity'] - prev_velocity
-        position_change = new_position - prev_position
-        logging.debug(
-            f"Movement state update - "
-            f"Position: {prev_position:.1f} → {new_position:.1f} (Δ{position_change:+.1f}), "
-            f"Velocity: {prev_velocity:.1f} → {axis_state['velocity']:.1f} (Δ{velocity_change:+.1f}), "
-            f"dt: {dt:.4f}"
-        )
+        if state_changed:
+            logging.debug(
+                f"Movement state transition:\n"
+                f"  Type: {get_transition_type(prev_velocity, target_velocity)}\n"
+                f"  Timing:\n"
+                f"    dt (requested): {dt:.4f}\n"
+                f"    dt (actual): {actual_dt:.4f}\n"
+                f"  Velocity:\n"
+                f"    previous: {prev_velocity:.2f}\n"
+                f"    target: {target_velocity:.2f}\n"
+                f"    new: {axis_state['velocity']:.2f}\n"
+                f"  Position:\n"
+                f"    previous: {prev_position:.1f}\n"
+                f"    delta: {position_delta:+.1f}\n"
+                f"    new: {new_position:.1f}"
+            )
+        elif abs(velocity_change) > 0.1 or abs(position_delta) > 0.1:
+            logging.debug(
+                f"Movement state update (significant change):\n"
+                f"  Position: {prev_position:.1f} → {new_position:.1f} (Δ{position_delta:+.1f})\n"
+                f"  Velocity: {prev_velocity:.1f} → {axis_state['velocity']:.1f} (Δ{velocity_change:+.1f})\n"
+                f"  Target velocity: {target_velocity:.1f}\n"
+                f"  dt: {dt:.4f}"
+            )
     
     return new_position
+
+def get_transition_type(prev_vel, target_vel):
+    """Helper to classify movement transitions"""
+    if prev_vel == 0 and target_vel != 0:
+        return "Starting movement"
+    elif prev_vel != 0 and target_vel == 0:
+        return "Stopping movement"
+    elif prev_vel * target_vel < 0:
+        return "Direction change"
+    else:
+        return "Continuous movement"
 
 def process_held_keys(pan_controller, tilt_controller):
     """
@@ -1321,15 +1589,23 @@ def process_held_keys(pan_controller, tilt_controller):
     tilt_velocity = 0.0
     max_speed = CONFIG['servo']['velocity']['max_speed']
     
+    # Process pan movement
     if key_states['a']['pressed']:
         pan_velocity = -max_speed
     elif key_states['d']['pressed']:
         pan_velocity = max_speed
+    else:
+        # No pan keys pressed, ensure velocity is zeroed
+        movement_state['pan']['velocity'] = 0.0
         
+    # Process tilt movement
     if key_states['w']['pressed']:
         tilt_velocity = -max_speed
     elif key_states['s']['pressed']:
         tilt_velocity = max_speed
+    else:
+        # No tilt keys pressed, ensure velocity is zeroed
+        movement_state['tilt']['velocity'] = 0.0
     
     # Update movement state and calculate new positions
     new_pan = update_movement_state(movement_state['pan'], pan_velocity, dt)
@@ -1344,42 +1620,17 @@ def process_held_keys(pan_controller, tilt_controller):
     tilt_controller.set_target(new_tilt)
     
     if CONFIG['debug'].get('pid_debug', False) and (pan_velocity != 0 or tilt_velocity != 0):
-        logging.debug(f"Velocity movement - pan: {pan_velocity:.2f}, tilt: {tilt_velocity:.2f}")
+        logging.debug(
+            f"Velocity movement:\n"
+            f"  Pan: velocity={pan_velocity:.2f}, keys=[a:{key_states['a']['pressed']}, d:{key_states['d']['pressed']}]\n"
+            f"  Tilt: velocity={tilt_velocity:.2f}, keys=[w:{key_states['w']['pressed']}, s:{key_states['s']['pressed']}]"
+        )
     
     return pan_controller.target_position, tilt_controller.target_position
 
-def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
+def handle_key_event(key, pan_controller, tilt_controller, terminal=None, is_new_press=False):
     """
     Handle key press events and update movement state.
-    
-    Provides the interface between user input and movement system:
-    - Key state management
-    - Velocity targeting
-    - Movement initialization
-    - Debug logging
-    - Preset switching
-    
-    Args:
-        key (int): ASCII value of pressed key
-        pan_controller (PID_Controller): Controller for pan axis
-        tilt_controller (PID_Controller): Controller for tilt axis
-        terminal (TerminalHandler, optional): Terminal interface for messages
-        
-    Returns:
-        tuple: (target_pan, target_tilt) positions
-        
-    Key mappings:
-    - a/A: Pan left
-    - d/D: Pan right
-    - w/W: Tilt up
-    - s/S: Tilt down
-    - c/C: Center both axes
-    - 1: Smooth preset
-    - 2: Responsive preset
-    - 3: Precise preset
-    - 4: Balanced preset
-    - [   : Decrease velocity scale
-    - ]   : Increase velocity scale
     """
     global key_states, movement_state, VELOCITY_SCALE
     current_time = time.time()
@@ -1415,14 +1666,30 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
     max_speed = CONFIG['servo']['velocity']['max_speed']
     debug_enabled = CONFIG['debug'].get('pid_debug', False)
     
-    def update_key_state(key_name, pressed, target_vel, opposing_key=None):
+    def update_key_state(key_name, pressed, target_vel, opposing_key=None, is_new_press=False):
         """Helper to update key state with debug logging"""
-        if pressed and not key_states[key_name]['pressed']:
-            # Key just pressed
-            key_states[key_name]['press_start'] = current_time
-            key_states[key_name]['target_velocity'] = target_vel
-            if debug_enabled:
-                logging.debug(f"Key '{key_name}' pressed - target velocity: {target_vel:.1f}")
+        prev_state = key_states[key_name].copy()  # Store previous state for comparison
+        
+        if pressed:
+            if is_new_press:  # Only update press_start on initial press
+                key_states[key_name]['press_start'] = current_time
+                key_states[key_name]['target_velocity'] = target_vel
+                if debug_enabled:
+                    logging.debug(
+                        f"Key '{key_name}' initial press:\n"
+                        f"  Time: {current_time:.3f}\n"
+                        f"  Target velocity: {target_vel:.1f}\n"
+                        f"  Previous state: {prev_state}"
+                    )
+            else:  # Key is being held
+                hold_duration = current_time - key_states[key_name]['press_start']
+                if debug_enabled:
+                    logging.debug(
+                        f"Key '{key_name}' held:\n"
+                        f"  Duration: {hold_duration:.3f}s\n"
+                        f"  Current velocity: {key_states[key_name]['velocity']:.1f}\n"
+                        f"  Target velocity: {target_vel:.1f}"
+                    )
         
         key_states[key_name]['pressed'] = pressed
         
@@ -1433,15 +1700,23 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
                     logging.debug(f"Releasing opposing key '{opposing_key}'")
             key_states[opposing_key]['pressed'] = False
             key_states[opposing_key]['target_velocity'] = 0.0
+            
+        # Log state changes
+        if debug_enabled and key_states[key_name] != prev_state:
+            logging.debug(
+                f"Key '{key_name}' state updated:\n"
+                f"  Previous: {prev_state}\n"
+                f"  Current: {key_states[key_name]}"
+            )
     
     if key in [ord('a'), ord('A')]:
-        update_key_state('a', True, -max_speed, opposing_key='d')
+        update_key_state('a', True, -max_speed, opposing_key='d', is_new_press=is_new_press)
     elif key in [ord('d'), ord('D')]:
-        update_key_state('d', True, max_speed, opposing_key='a')
+        update_key_state('d', True, max_speed, opposing_key='a', is_new_press=is_new_press)
     elif key in [ord('w'), ord('W')]:
-        update_key_state('w', True, -max_speed, opposing_key='s')
+        update_key_state('w', True, -max_speed, opposing_key='s', is_new_press=is_new_press)
     elif key in [ord('s'), ord('S')]:
-        update_key_state('s', True, max_speed, opposing_key='w')
+        update_key_state('s', True, max_speed, opposing_key='w', is_new_press=is_new_press)
     elif key in [ord('c'), ord('C')]:  # center
         if debug_enabled:
             logging.debug("Center command received - resetting all states")
@@ -1475,11 +1750,13 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
     if debug_enabled:
         active_keys = [k for k in key_states if key_states[k]['pressed']]
         if active_keys:
-            logging.debug(f"Active keys: {active_keys}, "
-                        f"Pan velocity targets: [a: {key_states['a']['target_velocity']:.1f}, "
-                        f"d: {key_states['d']['target_velocity']:.1f}], "
-                        f"Tilt velocity targets: [w: {key_states['w']['target_velocity']:.1f}, "
-                        f"s: {key_states['s']['target_velocity']:.1f}]")
+            logging.debug(
+                f"Active keys summary:\n"
+                f"  Keys: {active_keys}\n"
+                f"  Pan velocities: [a: {key_states['a']['target_velocity']:.1f}, d: {key_states['d']['target_velocity']:.1f}]\n"
+                f"  Tilt velocities: [w: {key_states['w']['target_velocity']:.1f}, s: {key_states['s']['target_velocity']:.1f}]\n"
+                f"  Movement state: {movement_state}"
+            )
     
     # Process movement immediately to avoid delay
     return process_held_keys(pan_controller, tilt_controller)
@@ -1595,6 +1872,9 @@ def main():
         start_time = time.time()
         recording = True
         
+        # Track which keys were pressed in the previous iteration
+        previously_pressed_keys = set()
+        
         # Show interface
         terminal.show_interface(log_file)
         
@@ -1622,8 +1902,48 @@ def main():
                     if not CONFIG['video']['show_preview']:
                         cv2.destroyAllWindows()
                 else:
+                    # Only treat as initial press if key wasn't pressed before
+                    is_new_press = key not in previously_pressed_keys
+                    previously_pressed_keys.add(key)
                     # Handle pan/tilt commands
-                    target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller, terminal)
+                    target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller, terminal, is_new_press)
+
+            # Check for key releases by comparing with previous state
+            current_keys = set()
+            if is_data():  # Keys are being pressed
+                char = getch_non_blocking()
+                while char:  # Get all currently pressed keys
+                    current_keys.add(ord(char.lower()))
+                    char = getch_non_blocking()
+            
+            # Handle key releases
+            released_keys = previously_pressed_keys - current_keys
+            for key in released_keys:
+                if chr(key) in key_states:
+                    # Fully reset the key state
+                    key_states[chr(key)] = {
+                        'pressed': False,
+                        'press_start': 0,
+                        'velocity': 0.0,
+                        'target_velocity': 0.0
+                    }
+                    if CONFIG['debug'].get('pid_debug', False):
+                        hold_duration = time.time() - key_states[chr(key)]['press_start']
+                        logging.debug(f"Key '{chr(key)}' released after {hold_duration:.3f}s - State fully reset")
+            
+            # Clear previously_pressed_keys if no keys are currently pressed
+            if not current_keys:
+                previously_pressed_keys.clear()
+                # Also ensure all key states are reset
+                for k in key_states:
+                    key_states[k] = {
+                        'pressed': False,
+                        'press_start': 0,
+                        'velocity': 0.0,
+                        'target_velocity': 0.0
+                    }
+            else:
+                previously_pressed_keys = current_keys
 
             # Get raw frame and process it
             ret = -1
@@ -1659,15 +1979,6 @@ def main():
                             # Handle pan/tilt commands
                             target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller, terminal)
                 frames_processed += 1
-
-            # Check for key releases
-            if not is_data():  # No keys being pressed
-                for k in key_states:
-                    if key_states[k]['pressed']:
-                        key_states[k]['pressed'] = False
-                        key_states[k]['press_start'] = 0
-                        if CONFIG['debug'].get('pid_debug', False):
-                            logging.debug(f"Key {k} released")
 
             # Update movement at fixed interval
             current_time = time.time()
@@ -1766,6 +2077,9 @@ def main():
         if recording:
             print(f"Last Recording: {video_path}")
         print("\nSession completed. Check log file for detailed statistics.")
+
+        # Cleanup and finalize log
+        finalize_logging(log_file)
 
 if __name__ == "__main__":
     main() 
