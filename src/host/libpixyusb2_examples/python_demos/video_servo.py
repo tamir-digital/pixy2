@@ -899,47 +899,23 @@ class PID_Controller:
     def update(self, error):
         """
         Update the controller state and calculate new output.
-        
-        This is the main control loop that:
-        1. Handles motion profile integration
-        2. Calculates PID terms
-        3. Applies anti-windup protection
-        4. Manages deadband
-        5. Produces final output command
-        
-        Args:
-            error (float): Current position error
-            
-        Returns:
-            int: The calculated command value for the servo
-            
-        The update process:
-        1. Check and update motion profile if active
-        2. Apply deadband to error if enabled
-        3. Calculate each PID term:
-           - Proportional: direct error scaling
-           - Integral: time-based integration with decay
-           - Derivative: based on movement state velocity
-        4. Apply anti-windup protection
-        5. Combine terms and apply limits
-        6. Convert to integer command
         """
         current_time = time.time()
         
         # Check if we're following a motion profile
         if self.motion.is_profile_active():
-            # Get next position from profile
-            profile_pos = self.motion.update()
-            if profile_pos is not None:
-                # Use profile position as intermediate target
-                error = profile_pos - self.command
-                if self.debug:
-                    logging.debug(f"Profile active - target: {profile_pos:.1f}, error: {error:.1f}")
-            else:
-                # Profile completed, use final target
+            # Only use motion profile for transitional movements (not continuous)
+            if any(k['pressed'] for k in key_states.values()):
+                # During continuous movement, bypass motion profile
+                self.motion.is_moving = False
                 error = self.target_position - self.command
-                if self.debug:
-                    logging.debug(f"Profile complete - target: {self.target_position:.1f}, error: {error:.1f}")
+            else:
+                # Get next position from profile for non-continuous movements
+                profile_pos = self.motion.update()
+                if profile_pos is not None:
+                    error = profile_pos - self.command
+                else:
+                    error = self.target_position - self.command
         
         if self.previous_error is not None and self.previous_time is not None:
             # Calculate time delta
@@ -956,21 +932,31 @@ class PID_Controller:
             if self.servo:
                 axis = 'pan' if self.proportion_gain == CONFIG['servo']['pan_gain'] else 'tilt'
                 current_velocity = movement_state[axis]['velocity']
+                
+                # Check if we're in continuous movement
+                is_continuous = any(k['pressed'] for k in key_states.values())
+                if is_continuous:
+                    # During continuous movement, use velocity-based control
+                    # Reduce derivative term influence to prevent fighting the velocity system
+                    d_term = -current_velocity * (self.derivative_gain * 0.25)  # Further reduced gain
+                else:
+                    # Normal derivative term for transitional movements
+                    d_term = -current_velocity * (self.derivative_gain * 0.5)
             else:
                 current_velocity = 0.0
+                d_term = 0.0
             
             # Calculate PID terms with float math
             p_term = working_error * self.proportion_gain
             
             # Enhanced integral term with time-based integration and decay
-            if self.integral_enabled and self.integral_gain != 0:  # Extra safety check
-                # Store previous integral for debug
+            if self.integral_enabled and self.integral_gain != 0:
                 prev_integral = self.integral_value
                 
                 # Apply decay to existing integral
                 self.integral_value *= self.integral_decay
                 
-                # Time-based integration (using smaller deadband for integral)
+                # Time-based integration
                 integral_error = working_error if not self.deadband_enabled else self.apply_deadband(working_error, self.integral_error_deadband)
                 self.integral_value += integral_error * dt
                 
@@ -979,67 +965,47 @@ class PID_Controller:
                     if self.command != self.previous_command:
                         command_delta = self.command - self.previous_command
                         if abs(command_delta) < abs(self.last_pid):
-                            windup_scale = 0.9  # Reduce integral by 10% when limited
+                            windup_scale = 0.9
                             self.integral_value *= windup_scale
-                            if self.debug:
-                                logging.debug(f"Anti-windup active - scale: {windup_scale}, "
-                                            f"command_delta: {command_delta:.2f}, last_pid: {self.last_pid:.2f}")
                 
                 # Apply limits
                 self.integral_value = min(max(self.integral_value, self.integral_min), self.integral_max)
                 
                 i_term = self.integral_value * self.integral_gain
-                
-                if self.debug:
-                    integral_change = self.integral_value - prev_integral
-                    logging.debug(f"Integral update - "
-                                f"prev: {prev_integral:.2f}, new: {self.integral_value:.2f}, "
-                                f"change: {integral_change:+.2f}, decay: {self.integral_decay:.3f}, "
-                                f"error: {integral_error:.2f}")
             else:
                 i_term = 0.0
             
-            # Improved derivative term using movement state velocity
-            # Note: current_velocity is already in the correct direction
-            d_term = -current_velocity * (self.derivative_gain * 0.5)  # Reduced gain
-            
-            # Combine terms (no feedforward)
+            # Combine terms
             pid = p_term + i_term + d_term
-            self.last_pid = pid  # Store for anti-windup
+            self.last_pid = pid
             
-            if self.debug:
+            if CONFIG['debug'].get('pid_debug', False):
                 logging.debug(
-                    f"PID calculation - "
-                    f"Target: {self.target_position:.1f}, Current: {self.command:.1f}, "
-                    f"Raw Error: {error:.2f}, Working Error: {working_error:.2f}, "
-                    f"Movement Velocity: {current_velocity:.2f}, "
-                    f"P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, "
-                    f"Total: {pid:.4f}, dt: {dt:.4f}"
+                    f"PID calculation:\n"
+                    f"  Mode: {'continuous' if any(k['pressed'] for k in key_states.values()) else 'transitional'}\n"
+                    f"  Target: {self.target_position:.1f}, Current: {self.command:.1f}\n"
+                    f"  Raw Error: {error:.2f}, Working Error: {working_error:.2f}\n"
+                    f"  Movement Velocity: {current_velocity:.2f}\n"
+                    f"  P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}\n"
+                    f"  Total: {pid:.4f}, dt: {dt:.4f}"
                 )
             
             if self.servo:
                 self.previous_command = self.command
-                # Calculate new command
                 new_command = self.command + pid
                 
                 # Apply output deadband if enabled
                 if self.deadband_enabled:
                     command_delta = new_command - self.command
                     if abs(command_delta) <= self.output_deadband:
-                        if self.debug:
-                            logging.debug(f"Output deadband active - delta: {command_delta:.2f} ≤ {self.output_deadband:.2f}")
                         new_command = self.command
                 
                 # Apply limits and convert to integer
-                prev_command = self.command
                 self.command = min(max(new_command, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
-                
-                if self.debug and self.command != new_command:
-                    logging.debug(f"Command limited - raw: {new_command:.1f}, limited: {self.command:.1f}")
         
         self.previous_error = float(error)
         self.previous_time = current_time
-        return int(round(self.command))  # Convert to integer for servo
+        return int(round(self.command))
 
 def is_data():
     """Check if there is data waiting on stdin"""
