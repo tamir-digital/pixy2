@@ -68,7 +68,16 @@ DEFAULT_CONFIG = {
         "motion": {
             "enabled": True,
             "move_duration": 0.1,  # 100ms for smooth steps
-            "debug": False         # Separate debug flag for motion profiling
+            "debug": False,        # Separate debug flag for motion profiling
+            "acceleration": {
+                "enabled": True,   # Enable acceleration control
+                "max_accel": 5000, # Maximum acceleration (units/s^2)
+                "smoothing": 0.7   # Smoothing factor (0-1), higher = smoother
+            },
+            "velocity": {
+                "max": 2000,      # Maximum velocity (units/s)
+                "min": 100        # Minimum velocity for small movements
+            }
         }
     },
     "debug": {
@@ -193,17 +202,32 @@ class MotionProfile:
             self.move_duration = float(self.config.get('move_duration', 0.1))
             self.debug = bool(self.config.get('debug', False))
             
+            # Get acceleration configuration
+            accel_config = self.config.get('acceleration', {})
+            self.accel_enabled = bool(accel_config.get('enabled', True))
+            self.max_accel = float(accel_config.get('max_accel', 5000))
+            self.smoothing = float(accel_config.get('smoothing', 0.7))
+            
+            # Get velocity configuration
+            vel_config = self.config.get('velocity', {})
+            self.max_vel = float(vel_config.get('max', 2000))
+            self.min_vel = float(vel_config.get('min', 100))
+            
             # Movement state
             self.is_moving = False
             self.start_pos = 0
             self.target_pos = 0
             self.current_pos = 0
             self.start_time = None
+            self.current_vel = 0
+            self.distance = 0
             
             if self.debug:
                 logging.info("Motion Profile initialized - "
                             f"enabled: {self.enabled}, "
-                            f"duration: {self.move_duration:.3f}s")
+                            f"duration: {self.move_duration:.3f}s, "
+                            f"accel: {self.max_accel:.1f}, "
+                            f"smoothing: {self.smoothing:.2f}")
                             
         except Exception as e:
             logging.error(f"Failed to initialize MotionProfile: {str(e)}, Config: {config}")
@@ -219,11 +243,29 @@ class MotionProfile:
         self.current_pos = self.start_pos
         self.start_time = time.time()
         self.is_moving = True
+        self.current_vel = 0
+        self.distance = abs(to_pos - from_pos)
         
         if self.debug:
             logging.debug(f"Starting move: {self.start_pos:.1f} → {self.target_pos:.1f}")
         
         return self.current_pos
+    
+    def _s_curve_progress(self, t):
+        """Calculate S-curve progress with configurable smoothing"""
+        if t <= 0:
+            return 0
+        if t >= 1:
+            return 1
+            
+        # Apply smoothing factor to create S-curve
+        t = t * (1 + (1 - self.smoothing) * 2) - (1 - self.smoothing)
+        progress = 1 / (1 + np.exp(-t * 12 + 6))  # Sigmoid function
+        
+        # Scale progress to ensure it reaches exactly 0 at t=0 and 1 at t=1
+        progress = (progress - 1/(1 + np.exp(6))) / (1/(1 + np.exp(-6)) - 1/(1 + np.exp(6)))
+        
+        return float(progress)
     
     def update(self):
         """Update motion profile and return next position"""
@@ -234,16 +276,33 @@ class MotionProfile:
         if elapsed >= self.move_duration:
             self.is_moving = False
             self.current_pos = self.target_pos
+            self.current_vel = 0
             if self.debug:
                 logging.debug(f"Move complete: {self.current_pos:.1f}")
             return self.current_pos
         
-        # Linear interpolation for first increment
+        # Calculate base progress
         progress = elapsed / self.move_duration
-        self.current_pos = self.start_pos + (self.target_pos - self.start_pos) * progress
+        
+        if self.accel_enabled:
+            # Use S-curve for smooth acceleration/deceleration
+            progress = self._s_curve_progress(progress)
+            
+            # Calculate velocity for debugging
+            if self.debug and elapsed > 0:
+                self.current_vel = (progress - self._s_curve_progress((elapsed - 0.001) / self.move_duration)) * self.distance / 0.001
+        else:
+            # Linear interpolation if acceleration control is disabled
+            if self.debug and elapsed > 0:
+                self.current_vel = self.distance / self.move_duration
+        
+        # Calculate new position
+        direction = 1 if self.target_pos > self.start_pos else -1
+        self.current_pos = self.start_pos + direction * self.distance * progress
         
         if self.debug:
-            logging.debug(f"Move progress: {progress:.2f}, pos: {self.current_pos:.1f}")
+            logging.debug(f"Move progress: {progress:.3f}, pos: {self.current_pos:.1f}, "
+                         f"vel: {self.current_vel:.1f}")
         
         return self.current_pos
     
