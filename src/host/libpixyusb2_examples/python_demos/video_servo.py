@@ -47,23 +47,28 @@ DEFAULT_CONFIG = {
         "show_preview": True
     },
     "servo": {
-        "pan_step": 100,
-        "tilt_step": 100,
+        "pan_step": 25,
+        "tilt_step": 25,
         "update_interval": 0.016,  # 60Hz
-        "pan_gain": 400,
-        "tilt_gain": 500,
+        "pan_gain": 250,
+        "tilt_gain": 300,
         "integral": {
             "enabled": True,
-            "decay_factor": 0.95,  # Integral memory decay (1.0 = no decay)
-            "max_limit": 2000,     # Maximum integral accumulation
-            "min_limit": -2000,    # Minimum integral accumulation
-            "anti_windup": True    # Enable back-calculation anti-windup
+            "decay_factor": 0.98,
+            "max_limit": 1000,
+            "min_limit": -1000,
+            "anti_windup": True
         },
         "deadband": {
             "enabled": True,
-            "error": 2.0,        # Ignore errors smaller than this
-            "output": 1.0,       # Don't move if command change smaller than this
-            "integral_error": 0.5 # Smaller deadband for integral accumulation
+            "error": 3.0,
+            "output": 2.0,
+            "integral_error": 1.0
+        },
+        "motion": {
+            "enabled": True,
+            "move_duration": 0.1,  # 100ms for smooth steps
+            "debug": False         # Separate debug flag for motion profiling
         }
     },
     "debug": {
@@ -169,6 +174,87 @@ PAN_GAIN = CONFIG['servo']['pan_gain']
 TILT_GAIN = CONFIG['servo']['tilt_gain']
 UPDATE_INTERVAL = CONFIG['servo']['update_interval']
 
+class MotionProfile:
+    """Generates smooth motion profiles for servo movements"""
+    
+    def __init__(self, config=None):
+        """Initialize motion profile generator"""
+        try:
+            # Ensure config is a dictionary
+            if config is None:
+                if 'servo' not in CONFIG or 'motion' not in CONFIG['servo']:
+                    raise ValueError("Missing motion configuration in CONFIG")
+                config = CONFIG['servo']['motion']
+            elif not isinstance(config, dict):
+                raise TypeError(f"Expected dict for config, got {type(config)}")
+            
+            self.config = config
+            self.enabled = bool(self.config.get('enabled', True))
+            self.move_duration = float(self.config.get('move_duration', 0.1))
+            self.debug = bool(self.config.get('debug', False))
+            
+            # Movement state
+            self.is_moving = False
+            self.start_pos = 0
+            self.target_pos = 0
+            self.current_pos = 0
+            self.start_time = None
+            
+            if self.debug:
+                logging.info("Motion Profile initialized - "
+                            f"enabled: {self.enabled}, "
+                            f"duration: {self.move_duration:.3f}s")
+                            
+        except Exception as e:
+            logging.error(f"Failed to initialize MotionProfile: {str(e)}, Config: {config}")
+            raise RuntimeError(f"Motion Profile initialization failed: {str(e)}") from e
+    
+    def start_move(self, from_pos, to_pos):
+        """Start a new movement from current position to target"""
+        if not self.enabled:
+            return to_pos
+            
+        self.start_pos = float(from_pos)
+        self.target_pos = float(to_pos)
+        self.current_pos = self.start_pos
+        self.start_time = time.time()
+        self.is_moving = True
+        
+        if self.debug:
+            logging.debug(f"Starting move: {self.start_pos:.1f} → {self.target_pos:.1f}")
+        
+        return self.current_pos
+    
+    def update(self):
+        """Update motion profile and return next position"""
+        if not self.enabled or not self.is_moving:
+            return None
+        
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.move_duration:
+            self.is_moving = False
+            self.current_pos = self.target_pos
+            if self.debug:
+                logging.debug(f"Move complete: {self.current_pos:.1f}")
+            return self.current_pos
+        
+        # Linear interpolation for first increment
+        progress = elapsed / self.move_duration
+        self.current_pos = self.start_pos + (self.target_pos - self.start_pos) * progress
+        
+        if self.debug:
+            logging.debug(f"Move progress: {progress:.2f}, pos: {self.current_pos:.1f}")
+        
+        return self.current_pos
+    
+    def is_profile_active(self):
+        """Check if profile is currently generating positions"""
+        return self.enabled and self.is_moving
+    
+    def get_target(self):
+        """Get the final target position"""
+        return self.target_pos if self.enabled else None
+
 class PID_Controller:
     def __init__(self, proportion_gain, integral_gain, derivative_gain, servo):
         # Convert gains to float equivalents of the bit-shifted values
@@ -193,6 +279,11 @@ class PID_Controller:
         self.output_deadband = float(deadband_config.get('output', 1.0))
         self.integral_error_deadband = float(deadband_config.get('integral_error', 0.5))
         
+        # Initialize motion profile
+        motion_config = CONFIG['servo'].get('motion', {})
+        self.motion = MotionProfile(config=motion_config)
+        self.target_position = PIXY_RCS_CENTER_POSITION if servo else 0
+        
         # Safety checks
         if self.integral_gain == 0:
             self.integral_enabled = False
@@ -209,6 +300,16 @@ class PID_Controller:
         self.command = float(PIXY_RCS_CENTER_POSITION if self.servo else 0)
         self.previous_command = self.command
         self.last_pid = 0.0  # Store last PID output for anti-windup
+        self.target_position = self.command
+
+    def set_target(self, new_target):
+        """Set a new target position with motion profile"""
+        if self.motion.enabled and abs(new_target - self.target_position) > self.error_deadband:
+            # Start a new motion profile for significant changes
+            self.motion.start_move(self.command, new_target)
+            if self.debug:
+                logging.debug(f"Starting profiled move to {new_target:.1f}")
+        self.target_position = new_target
 
     def apply_deadband(self, value, deadband):
         """Apply deadband to a value"""
@@ -218,6 +319,16 @@ class PID_Controller:
 
     def update(self, error):
         current_time = time.time()
+        
+        # Check if we're following a motion profile
+        if self.motion.is_profile_active():
+            # Get next position from profile
+            profile_pos = self.motion.update()
+            if profile_pos is not None:
+                # Calculate error to profile position
+                error = profile_pos - self.command
+                if self.debug:
+                    logging.debug(f"Profile active - pos: {profile_pos:.1f}, error: {error:.1f}")
         
         if self.previous_error is not None and self.previous_time is not None:
             # Calculate time delta
@@ -443,19 +554,28 @@ def get_video_path():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(ensure_output_dir(), f"pixy2_recording_{timestamp}.avi")
 
-def handle_key_event(key, target_pan, target_tilt):
-    """Handle keyboard input from both terminal and OpenCV window"""
+def handle_key_event(key, pan_controller, tilt_controller):
+    """Modified to use controller objects directly"""
+    current_pan = pan_controller.command
+    current_tilt = tilt_controller.command
+    
     if key in [ord('a'), ord('A')]:  # left
-        return max(PIXY_RCS_MINIMUM_POSITION, target_pan - PAN_STEP), target_tilt
+        new_pan = max(PIXY_RCS_MINIMUM_POSITION, current_pan - PAN_STEP)
+        pan_controller.set_target(new_pan)
     elif key in [ord('d'), ord('D')]:  # right
-        return min(PIXY_RCS_MAXIMUM_POSITION, target_pan + PAN_STEP), target_tilt
+        new_pan = min(PIXY_RCS_MAXIMUM_POSITION, current_pan + PAN_STEP)
+        pan_controller.set_target(new_pan)
     elif key in [ord('s'), ord('S')]:  # up
-        return target_pan, min(PIXY_RCS_MAXIMUM_POSITION, target_tilt + TILT_STEP)
+        new_tilt = min(PIXY_RCS_MAXIMUM_POSITION, current_tilt + TILT_STEP)
+        tilt_controller.set_target(new_tilt)
     elif key in [ord('w'), ord('W')]:  # down
-        return target_pan, max(PIXY_RCS_MINIMUM_POSITION, target_tilt - TILT_STEP)
+        new_tilt = max(PIXY_RCS_MINIMUM_POSITION, current_tilt - TILT_STEP)
+        tilt_controller.set_target(new_tilt)
     elif key in [ord('c'), ord('C')]:  # center
-        return PIXY_RCS_CENTER_POSITION, PIXY_RCS_CENTER_POSITION
-    return target_pan, target_tilt
+        pan_controller.set_target(PIXY_RCS_CENTER_POSITION)
+        tilt_controller.set_target(PIXY_RCS_CENTER_POSITION)
+    
+    return pan_controller.target_position, tilt_controller.target_position
 
 def init_pixy_with_suppression():
     """Initialize Pixy2 with all debug output suppressed"""
@@ -581,7 +701,7 @@ def main():
                         cv2.destroyAllWindows()
                 else:
                     # Handle pan/tilt commands
-                    target_pan, target_tilt = handle_key_event(key, target_pan, target_tilt)
+                    target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller)
 
             # Get raw frame and process it
             ret = -1
@@ -615,7 +735,7 @@ def main():
                             cv2.destroyAllWindows()
                         else:
                             # Handle pan/tilt commands
-                            target_pan, target_tilt = handle_key_event(key, target_pan, target_tilt)
+                            target_pan, target_tilt = handle_key_event(key, pan_controller, tilt_controller)
                 frames_processed += 1
 
             # Update movement at fixed interval
@@ -664,7 +784,9 @@ def main():
     except KeyboardInterrupt:
         terminal.show_message("Exiting...")
     except Exception as e:
-        logging.error(f"Error occurred: {str(e)}")
+        import traceback
+        error_details = traceback.format_exc()
+        logging.error(f"Error occurred: {str(e)}\nTraceback:\n{error_details}")
         terminal.show_message("Error occurred. Check log file for details.")
 
     finally:
