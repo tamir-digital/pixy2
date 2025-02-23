@@ -1377,78 +1377,96 @@ def calculate_velocity(current_velocity, target_velocity, dt):
     # Calculate desired velocity change
     desired_delta = scaled_target - current_velocity
     
-    # Add detailed key hold debug logging
+    # Detect direction change
+    is_direction_change = (current_velocity * scaled_target < 0)
+    
+    # Add detailed diagnostic logging for slowdown investigation
     if CONFIG['debug'].get('pid_debug', False):
-        hold_duration = 0
-        for key, state in key_states.items():
-            if state['pressed']:
-                hold_duration = time.time() - state['press_start']
-                logging.debug(
-                    f"Key '{key}' held for {hold_duration:.2f}s - "
-                    f"Current vel: {current_velocity:.2f}, "
-                    f"Target vel: {target_velocity:.2f}, "
-                    f"Scaled target: {scaled_target:.2f}, "
-                    f"Desired delta: {desired_delta:.2f}, "
-                    f"Max delta: {max_delta:.2f}"
-                )
+        active_keys = [k for k, v in key_states.items() if v['pressed']]
+        if active_keys:
+            logging.debug(
+                f"=== VELOCITY CALCULATION DIAGNOSTICS ===\n"
+                f"Active keys: {active_keys}\n"
+                f"Time metrics:\n"
+                f"  Current time: {time.time():.3f}\n"
+                f"  Key hold durations: {', '.join(f'{k}: {time.time() - key_states[k]['press_start']:.2f}s' for k in active_keys)}\n"
+                f"Velocity metrics:\n"
+                f"  Current velocity: {current_velocity:.2f}\n"
+                f"  Target velocity: {target_velocity:.2f}\n"
+                f"  Scaled target: {scaled_target:.2f}\n"
+                f"  Desired delta: {desired_delta:.2f}\n"
+                f"  Max delta: {max_delta:.2f}\n"
+                f"  Scale factor: {VELOCITY_SCALE:.2f}\n"
+                f"  Direction change: {is_direction_change}\n"
+                f"Thresholds:\n"
+                f"  Min speed: {min_speed:.2f}\n"
+                f"  Max accel: {max_accel:.2f}"
+            )
     
-    # Apply smooth acceleration curve
-    accel_scale = 0.0  # Initialize for logging
-    smoothed_accel = 0.0  # Initialize for logging
-    actual_delta = 0.0  # Initialize for logging
-    
-    if abs(desired_delta) > 0:
-        # Scale acceleration based on how close we are to target velocity
-        accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
+    # Special handling for direction changes
+    if is_direction_change:
+        # On direction change, apply stronger acceleration and reduced smoothing
+        direction = 1 if scaled_target > 0 else -1
+        # Start at 40% of target velocity in new direction
+        new_velocity = direction * abs(scaled_target) * 0.4
         
-        # Apply enhanced smoothing if enabled
-        if smoothing_config.get('enabled', True):
-            smoothing_factor = float(smoothing_config.get('factor', 0.8))
-            # Only apply smoothing during initial acceleration, not during sustained movement
-            if abs(current_velocity) < abs(scaled_target):
+        if CONFIG['debug'].get('pid_debug', False):
+            logging.debug(
+                f"Direction change handling:\n"
+                f"  Old velocity: {current_velocity:.2f}\n"
+                f"  Initial new velocity: {new_velocity:.2f}\n"
+                f"  Target: {scaled_target:.2f}"
+            )
+        
+        return new_velocity
+    
+    # Normal movement - calculate acceleration scale
+    if abs(desired_delta) > 0:
+        # For sustained movement, maintain target velocity
+        if abs(current_velocity) > 0 and abs(desired_delta) < 0.1:
+            new_velocity = current_velocity
+        else:
+            # Scale acceleration based on absolute distance from target
+            accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
+            
+            # Apply enhanced smoothing if enabled, but only during acceleration
+            if smoothing_config.get('enabled', True) and abs(current_velocity) < abs(scaled_target):
+                smoothing_factor = float(smoothing_config.get('factor', 0.8))
                 # Apply sigmoid-like smoothing to acceleration
                 accel_scale = accel_scale * (3 - 2 * accel_scale) * smoothing_factor
-            else:
-                # During sustained movement, maintain target velocity
-                accel_scale = 1.0
-        
-        # Apply smoothing to acceleration
-        smoothed_accel = max_delta * (0.2 + 0.8 * accel_scale)  # Never less than 20% acceleration
-        # Limit velocity change by smoothed acceleration
-        actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
-    
-    # Calculate new velocity
-    new_velocity = current_velocity + actual_delta
-    
-    # During sustained movement at target velocity, maintain it exactly
-    if abs(abs(current_velocity) - abs(scaled_target)) < 0.1:
-        new_velocity = scaled_target
+            
+            # Apply smoothing to acceleration
+            smoothed_accel = max_delta * (0.2 + 0.8 * accel_scale)  # Never less than 20% acceleration
+            # Limit velocity change by smoothed acceleration
+            actual_delta = max(-smoothed_accel, min(smoothed_accel, desired_delta))
+            new_velocity = current_velocity + actual_delta
+            
+            # If we're very close to target velocity, snap to it
+            if abs(new_velocity - scaled_target) < 0.1:
+                new_velocity = scaled_target
+    else:
+        # No change in velocity needed
+        new_velocity = current_velocity
     
     # Apply minimum speed threshold to avoid tiny movements
-    min_speed_applied = False  # For logging
     if abs(new_velocity) < min_speed:
         if abs(scaled_target) > 0:
             # If we have a target, maintain minimum speed
             new_velocity = min_speed * (1 if scaled_target > 0 else -1)
-            min_speed_applied = True
         else:
-            # If no target, come to a stop with smooth deceleration
-            decel_factor = 0.8  # Smooth deceleration
-            new_velocity = current_velocity * decel_factor
-            # Stop completely if very slow
-            if abs(new_velocity) < min_speed * 0.5:
-                new_velocity = 0.0
+            # If no target, come to a stop
+            new_velocity = 0.0
     
-    # Enhanced debug logging for key holds
-    if CONFIG['debug'].get('pid_debug', False) and any(state['pressed'] for state in key_states.values()):
+    # Enhanced debug logging
+    if CONFIG['debug'].get('pid_debug', False):
         logging.debug(
             f"Velocity calculation results:\n"
             f"  Acceleration:\n"
-            f"    scale: {accel_scale:.3f}\n"
-            f"    smoothed: {smoothed_accel:.2f}\n"
-            f"    actual delta: {actual_delta:.2f}\n"
+            f"    scale: {accel_scale if 'accel_scale' in locals() else 0.0:.3f}\n"
+            f"    smoothed: {smoothed_accel if 'smoothed_accel' in locals() else 0.0:.2f}\n"
+            f"    actual delta: {actual_delta if 'actual_delta' in locals() else 0.0:.2f}\n"
             f"  Final velocity: {new_velocity:.2f}\n"
-            f"  Min speed applied: {min_speed_applied}"
+            f"  Min speed applied: {abs(new_velocity) == min_speed and abs(scaled_target) > 0}"
         )
     
     return new_velocity
@@ -1673,26 +1691,20 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None, is_new
         if pressed:
             if is_new_press:  # Only update press_start on initial press
                 key_states[key_name]['press_start'] = current_time
-                key_states[key_name]['target_velocity'] = target_vel
-                if debug_enabled:
-                    logging.debug(
-                        f"Key '{key_name}' initial press:\n"
-                        f"  Time: {current_time:.3f}\n"
-                        f"  Target velocity: {target_vel:.1f}\n"
-                        f"  Previous state: {prev_state}"
-                    )
-            else:  # Key is being held
+            key_states[key_name]['target_velocity'] = target_vel
+            key_states[key_name]['pressed'] = True
+            if debug_enabled:
                 hold_duration = current_time - key_states[key_name]['press_start']
-                if debug_enabled:
-                    logging.debug(
-                        f"Key '{key_name}' held:\n"
-                        f"  Duration: {hold_duration:.3f}s\n"
-                        f"  Current velocity: {key_states[key_name]['velocity']:.1f}\n"
-                        f"  Target velocity: {target_vel:.1f}"
-                    )
-        
-        key_states[key_name]['pressed'] = pressed
-        
+                logging.debug(
+                    f"Key '{key_name}' {'initial press' if is_new_press else 'held'}:\n"
+                    f"  Time: {current_time:.3f}\n"
+                    f"  Target velocity: {target_vel:.1f}\n"
+                    f"  Previous state: {prev_state}"
+                )
+        else:
+            key_states[key_name]['pressed'] = False
+            key_states[key_name]['target_velocity'] = 0.0
+            
         # Handle opposing key
         if opposing_key and pressed:
             if key_states[opposing_key]['pressed']:
