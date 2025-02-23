@@ -100,8 +100,12 @@ if platform.system() == 'Darwin':
 PIXY_RCS_MAXIMUM_POSITION = 1000
 PIXY_RCS_MINIMUM_POSITION = 0
 PIXY_RCS_CENTER_POSITION = ((PIXY_RCS_MAXIMUM_POSITION - PIXY_RCS_MINIMUM_POSITION) / 2)
-PAN_STEP = 25
-TILT_STEP = 25
+
+# Global velocity scale (can be adjusted at runtime)
+VELOCITY_SCALE = 1.0
+VELOCITY_SCALE_STEP = 0.25  # How much to change scale per keypress
+VELOCITY_SCALE_MAX = 5.0    # Maximum allowed scale
+VELOCITY_SCALE_MIN = 0.25   # Minimum allowed scale
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -112,8 +116,6 @@ DEFAULT_CONFIG = {
         "show_preview": True
     },
     "servo": {
-        "pan_step": 25,
-        "tilt_step": 25,
         "update_interval": 0.016,  # 60Hz
         "pan_gain": 200,          # Reduced from 250
         "tilt_gain": 240,         # Reduced from 300
@@ -1170,42 +1172,26 @@ def get_video_path():
 def calculate_velocity(current_velocity, target_velocity, dt):
     """
     Calculate new velocity based on acceleration limits and smoothing.
-    
-    Implements sophisticated velocity control with:
-    - Acceleration limiting
-    - Smoothing for natural motion
-    - Minimum speed thresholds
-    - Scaled acceleration curves
-    
-    Args:
-        current_velocity (float): Current velocity
-        target_velocity (float): Desired target velocity
-        dt (float): Time delta since last update
-        
-    Returns:
-        float: New calculated velocity respecting limits and smoothing
-        
-    The calculation:
-    1. Applies acceleration limits
-    2. Uses smoothing for natural feel
-    3. Handles minimum speed threshold
-    4. Provides smooth deceleration
     """
+    global VELOCITY_SCALE
     velocity_config = CONFIG['servo']['velocity']
-    max_accel = velocity_config['acceleration']
+    max_accel = velocity_config['acceleration'] * VELOCITY_SCALE
     min_speed = velocity_config['min_speed']
     smoothing_config = velocity_config.get('smoothing', {})
+    
+    # Scale target velocity by global scale factor
+    scaled_target = target_velocity * VELOCITY_SCALE
     
     # Calculate maximum velocity change for this time step
     max_delta = max_accel * dt
     
     # Calculate desired velocity change
-    desired_delta = target_velocity - current_velocity
+    desired_delta = scaled_target - current_velocity
     
     # Apply smooth acceleration curve
     if abs(desired_delta) > 0:
         # Scale acceleration based on how close we are to target velocity
-        accel_scale = min(1.0, abs(desired_delta) / abs(target_velocity) if target_velocity != 0 else 0)
+        accel_scale = min(1.0, abs(desired_delta) / abs(scaled_target) if scaled_target != 0 else 0)
         
         # Apply enhanced smoothing if enabled
         if smoothing_config.get('enabled', True):
@@ -1225,9 +1211,9 @@ def calculate_velocity(current_velocity, target_velocity, dt):
     
     # Apply minimum speed threshold to avoid tiny movements
     if abs(new_velocity) < min_speed:
-        if abs(target_velocity) > 0:
+        if abs(scaled_target) > 0:
             # If we have a target, maintain minimum speed
-            new_velocity = min_speed * (1 if target_velocity > 0 else -1)
+            new_velocity = min_speed * (1 if scaled_target > 0 else -1)
         else:
             # If no target, come to a stop with smooth deceleration
             decel_factor = 0.8  # Smooth deceleration
@@ -1240,7 +1226,7 @@ def calculate_velocity(current_velocity, target_velocity, dt):
         logging.debug(
             f"Velocity calculation - "
             f"current: {current_velocity:.2f}, "
-            f"target: {target_velocity:.2f}, "
+            f"target: {scaled_target:.2f}, "
             f"dt: {dt:.4f}, "
             f"max_delta: {max_delta:.2f}, "
             f"actual_delta: {actual_delta:.2f}, "
@@ -1321,20 +1307,9 @@ def process_held_keys(pan_controller, tilt_controller):
         
     Returns:
         tuple: (target_pan, target_tilt) positions
-        
-    The process:
-    1. Calculates time delta
-    2. Determines target velocities
-    3. Updates movement state
-    4. Updates controller targets
-    5. Applies position limits
     """
     global key_states, movement_state
     current_time = time.time()
-    
-    if not CONFIG['servo']['velocity']['enabled']:
-        # Use existing step-based movement if velocity mode is disabled
-        return process_held_keys_legacy(pan_controller, tilt_controller)
     
     # Calculate time delta
     dt = current_time - movement_state['pan']['last_update']
@@ -1373,56 +1348,6 @@ def process_held_keys(pan_controller, tilt_controller):
     
     return pan_controller.target_position, tilt_controller.target_position
 
-def process_held_keys_legacy(pan_controller, tilt_controller):
-    """Legacy step-based movement (kept as fallback)"""
-    global key_states
-    current_time = time.time()
-    
-    # Get step sizes from config
-    pan_step = CONFIG['servo']['pan_step']
-    tilt_step = CONFIG['servo']['tilt_step']
-    
-    # Calculate hold duration and scale step size
-    def get_scaled_step(key, base_step):
-        if not key_states[key]['pressed']:
-            return 0
-        hold_duration = current_time - key_states[key]['press_start']
-        # Start with smaller steps and ramp up
-        scale = min(1.0, hold_duration * 5.0)  # Reach full speed in 0.2 seconds
-        return base_step * scale
-    
-    # Calculate pan movement
-    pan_step_size = 0
-    if key_states['a']['pressed']:
-        pan_step_size = -get_scaled_step('a', pan_step)
-    elif key_states['d']['pressed']:
-        pan_step_size = get_scaled_step('d', pan_step)
-        
-    # Calculate tilt movement
-    tilt_step_size = 0
-    if key_states['w']['pressed']:
-        tilt_step_size = -get_scaled_step('w', tilt_step)
-    elif key_states['s']['pressed']:
-        tilt_step_size = get_scaled_step('s', tilt_step)
-    
-    # Apply movements if any keys are held
-    if pan_step_size != 0:
-        new_pan = max(PIXY_RCS_MINIMUM_POSITION, 
-                     min(PIXY_RCS_MAXIMUM_POSITION, 
-                         pan_controller.command + pan_step_size))
-        pan_controller.set_target(new_pan)
-        
-    if tilt_step_size != 0:
-        new_tilt = max(PIXY_RCS_MINIMUM_POSITION,
-                      min(PIXY_RCS_MAXIMUM_POSITION,
-                          tilt_controller.command + tilt_step_size))
-        tilt_controller.set_target(new_tilt)
-    
-    if CONFIG['debug'].get('pid_debug', False) and (pan_step_size != 0 or tilt_step_size != 0):
-        logging.debug(f"Legacy movement - pan_step: {pan_step_size:.2f}, tilt_step: {tilt_step_size:.2f}")
-    
-    return pan_controller.target_position, tilt_controller.target_position
-
 def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
     """
     Handle key press events and update movement state.
@@ -1453,13 +1378,11 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
     - 2: Responsive preset
     - 3: Precise preset
     - 4: Balanced preset
+    - [   : Decrease velocity scale
+    - ]   : Increase velocity scale
     """
-    global key_states, movement_state
+    global key_states, movement_state, VELOCITY_SCALE
     current_time = time.time()
-    
-    if not CONFIG['servo']['velocity']['enabled']:
-        # Use legacy step-based movement if velocity mode is disabled
-        return handle_key_event_legacy(key, pan_controller, tilt_controller)
     
     # Handle preset switching
     preset_keys = {
@@ -1474,6 +1397,18 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
         if apply_movement_preset(preset_name, pan_controller, tilt_controller):
             if terminal:
                 terminal.show_message(f"Switched to {preset_name} preset")
+        return pan_controller.target_position, tilt_controller.target_position
+    
+    # Handle velocity scale adjustment
+    if key == ord('['):  # Decrease scale
+        VELOCITY_SCALE = max(VELOCITY_SCALE_MIN, VELOCITY_SCALE - VELOCITY_SCALE_STEP)
+        if terminal:
+            terminal.show_message(f"Velocity scale: {VELOCITY_SCALE:.2f}x")
+        return pan_controller.target_position, tilt_controller.target_position
+    elif key == ord(']'):  # Increase scale
+        VELOCITY_SCALE = min(VELOCITY_SCALE_MAX, VELOCITY_SCALE + VELOCITY_SCALE_STEP)
+        if terminal:
+            terminal.show_message(f"Velocity scale: {VELOCITY_SCALE:.2f}x")
         return pan_controller.target_position, tilt_controller.target_position
     
     # Update key states and set target velocities
@@ -1548,51 +1483,6 @@ def handle_key_event(key, pan_controller, tilt_controller, terminal=None):
     
     # Process movement immediately to avoid delay
     return process_held_keys(pan_controller, tilt_controller)
-
-def handle_key_event_legacy(key, pan_controller, tilt_controller):
-    """Legacy step-based key handling"""
-    global key_states
-    current_pan = pan_controller.command
-    current_tilt = tilt_controller.command
-    
-    # Get step sizes from config
-    pan_step = CONFIG['servo']['pan_step']
-    tilt_step = CONFIG['servo']['tilt_step']
-    
-    # Update key states
-    current_time = time.time()
-    if key in [ord('a'), ord('A')]:
-        if not key_states['a']['pressed']:
-            key_states['a']['press_start'] = current_time
-        key_states['a']['pressed'] = True
-        new_pan = max(PIXY_RCS_MINIMUM_POSITION, current_pan - pan_step)
-        pan_controller.set_target(new_pan)
-    elif key in [ord('d'), ord('D')]:
-        if not key_states['d']['pressed']:
-            key_states['d']['press_start'] = current_time
-        key_states['d']['pressed'] = True
-        new_pan = min(PIXY_RCS_MAXIMUM_POSITION, current_pan + pan_step)
-        pan_controller.set_target(new_pan)
-    elif key in [ord('s'), ord('S')]:
-        if not key_states['s']['pressed']:
-            key_states['s']['press_start'] = current_time
-        key_states['s']['pressed'] = True
-        new_tilt = min(PIXY_RCS_MAXIMUM_POSITION, current_tilt + tilt_step)
-        tilt_controller.set_target(new_tilt)
-    elif key in [ord('w'), ord('W')]:
-        if not key_states['w']['pressed']:
-            key_states['w']['press_start'] = current_time
-        key_states['w']['pressed'] = True
-        new_tilt = max(PIXY_RCS_MINIMUM_POSITION, current_tilt - tilt_step)
-        tilt_controller.set_target(new_tilt)
-    elif key in [ord('c'), ord('C')]:
-        for k in key_states:
-            key_states[k]['pressed'] = False
-            key_states[k]['press_start'] = 0
-        pan_controller.set_target(PIXY_RCS_CENTER_POSITION)
-        tilt_controller.set_target(PIXY_RCS_CENTER_POSITION)
-    
-    return pan_controller.target_position, tilt_controller.target_position
 
 def init_pixy_with_suppression():
     """Initialize Pixy2 with all debug output suppressed"""
@@ -1689,6 +1579,9 @@ def main():
         print("  2   : Responsive (quick)")
         print("  3   : Precise (balanced speed)")
         print("  4   : Balanced (default)")
+        print("\nSpeed Control:")
+        print("  [   : Decrease velocity scale")
+        print("  ]   : Increase velocity scale")
         print("\nVideo:")
         print("  r   : Toggle recording")
         print("  p   : Toggle preview")
@@ -1803,7 +1696,7 @@ def main():
                     
                     # Update status display with fixed-width formatting
                     status = f"[{('REC' if recording else 'PAUSE'):4s}] "
-                    status += f"Pan: {int(current_pan):4d} Tilt: {int(current_tilt):4d}"
+                    status += f"Pan: {int(current_pan):4d} Tilt: {int(current_tilt):4d} Speed: {VELOCITY_SCALE:.1f}x"
                     if CONFIG['debug']['show_fps']:
                         status += f" FPS: {fps:5.1f}"
                     if recording:
