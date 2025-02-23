@@ -51,13 +51,20 @@ DEFAULT_CONFIG = {
         "tilt_step": 100,
         "update_interval": 0.016,  # 60Hz
         "pan_gain": 400,
-        "tilt_gain": 500
+        "tilt_gain": 500,
+        "integral": {
+            "enabled": True,
+            "decay_factor": 0.95,  # Integral memory decay (1.0 = no decay)
+            "max_limit": 2000,     # Maximum integral accumulation
+            "min_limit": -2000,    # Minimum integral accumulation
+            "anti_windup": True    # Enable back-calculation anti-windup
+        }
     },
     "debug": {
         "log_level": "INFO",
         "show_fps": True,
-        "suppress_pixy_debug": True,  # New option to control Pixy debug output
-        "pid_debug": False  # New option for PID debug output
+        "suppress_pixy_debug": True,
+        "pid_debug": False
     }
 }
 
@@ -161,10 +168,25 @@ class PID_Controller:
         # Convert gains to float equivalents of the bit-shifted values
         self.proportion_gain = float(proportion_gain) / 1024.0  # Equivalent of >> 10
         self.integral_gain = float(integral_gain) / 16384.0    # Equivalent of >> 14 (>> 10 and >> 4)
-        # Scale derivative gain to match old behavior at 60Hz
         self.derivative_gain = float(derivative_gain) / 1024.0 * UPDATE_INTERVAL  # Scale for time-based calculation
         self.servo = servo
         self.debug = CONFIG['debug'].get('pid_debug', False)
+        
+        # Get integral configuration
+        integral_config = CONFIG['servo'].get('integral', {})
+        self.integral_enabled = integral_config.get('enabled', True)
+        self.integral_decay = integral_config.get('decay_factor', 1.0)
+        self.integral_max = float(integral_config.get('max_limit', PID_MAXIMUM_INTEGRAL))
+        self.integral_min = float(integral_config.get('min_limit', PID_MINIMUM_INTEGRAL))
+        self.anti_windup = integral_config.get('anti_windup', True)
+        
+        # Safety checks
+        if self.integral_gain == 0:
+            self.integral_enabled = False
+            self.anti_windup = False
+            if self.debug:
+                logging.warning("Integral control disabled due to zero gain")
+        
         self.reset()
 
     def reset(self):
@@ -172,6 +194,8 @@ class PID_Controller:
         self.previous_time = None
         self.integral_value = 0.0
         self.command = float(PIXY_RCS_CENTER_POSITION if self.servo else 0)
+        self.previous_command = self.command
+        self.last_pid = 0.0  # Store last PID output for anti-windup
 
     def update(self, error):
         current_time = time.time()
@@ -182,23 +206,47 @@ class PID_Controller:
             if dt <= 0:  # Avoid division by zero or negative time
                 dt = UPDATE_INTERVAL
             
-            # Update integral with float
-            self.integral_value = float(self.integral_value + error)
-            self.integral_value = min(max(self.integral_value, float(PID_MINIMUM_INTEGRAL)), float(PID_MAXIMUM_INTEGRAL))
-            
             # Calculate PID terms with float math
             p_term = error * self.proportion_gain
-            i_term = self.integral_value * self.integral_gain
-            # Time-based derivative (Δerror/Δtime)
+            
+            # Enhanced integral term with time-based integration and decay
+            if self.integral_enabled and self.integral_gain != 0:  # Extra safety check
+                # Apply decay to existing integral
+                self.integral_value *= self.integral_decay
+                
+                # Time-based integration
+                self.integral_value += error * dt
+                
+                # Anti-windup using clamping and back-calculation
+                if self.anti_windup:
+                    if self.command != self.previous_command:
+                        # Calculate how much of the change was actually applied
+                        command_delta = self.command - self.previous_command
+                        # If we're limited, scale back the integral
+                        if abs(command_delta) < abs(self.last_pid):
+                            windup_scale = 0.9  # Reduce integral by 10% when limited
+                            self.integral_value *= windup_scale
+                
+                # Apply limits
+                self.integral_value = min(max(self.integral_value, self.integral_min), self.integral_max)
+                
+                i_term = self.integral_value * self.integral_gain
+            else:
+                i_term = 0.0
+            
+            # Time-based derivative
             d_term = ((error - self.previous_error) / dt) * self.derivative_gain
             
             # Combine terms
             pid = p_term + i_term + d_term
+            self.last_pid = pid  # Store for anti-windup
             
             if self.debug:
-                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, Total: {pid:.4f}, dt: {dt:.4f}")
+                logging.debug(f"PID terms - P: {p_term:.4f}, I: {i_term:.4f}, D: {d_term:.4f}, "
+                            f"Total: {pid:.4f}, dt: {dt:.4f}, Integral: {self.integral_value:.4f}")
             
             if self.servo:
+                self.previous_command = self.command
                 # Update command with float math but return as integer
                 self.command = min(max(self.command + pid, float(PIXY_RCS_MINIMUM_POSITION)), float(PIXY_RCS_MAXIMUM_POSITION))
         
